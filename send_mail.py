@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 import argparse
+import sys
 import html
 import json
 import logging
 import os
+import re
 import smtplib
 import ssl
 import time
@@ -41,6 +43,14 @@ SMTP_USER = os.getenv("SMTP_USER", os.getenv("EMAIL", ""))
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", os.getenv("PASSWORD", ""))
 SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
 SMTP_TO = os.getenv("SMTP_TO", "")
+
+MAIL_PROVIDER = os.getenv("MAIL_PROVIDER", "").lower()
+MAILERSEND_API_KEY = os.getenv("MAILERSEND_API_KEY", "")
+MAILERSEND_API_URL = os.getenv("MAILERSEND_API_URL", "https://api.mailersend.com/v1/email")
+MAILERSEND_FROM = os.getenv("MAILERSEND_FROM", SMTP_FROM)
+MAILERSEND_FROM_NAME = os.getenv("MAILERSEND_FROM_NAME", "")
+MAILERSEND_TO = os.getenv("MAILERSEND_TO", SMTP_TO)
+MAILERSEND_USER_AGENT = os.getenv("MAILERSEND_USER_AGENT", "openfang-news/1.0")
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
@@ -379,6 +389,166 @@ def fallback_digest(ollama_error):
     return "\n".join(lines)
 
 
+def render_inline_markdown(text):
+    escaped = html.escape(text)
+
+    def replace_link(match):
+        label = match.group(1)
+        url = html.unescape(match.group(2))
+        if not url.startswith(("http://", "https://", "mailto:")):
+            return match.group(0)
+        return (
+            f'<a href="{html.escape(url, quote=True)}" '
+            'style="color:#0969da;text-decoration:none;font-weight:600">'
+            f"{label}</a>"
+        )
+
+    escaped = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", replace_link, escaped)
+    escaped = re.sub(
+        r"`([^`]+)`",
+        r'<code style="font-family:Menlo,Consolas,monospace;font-size:13px;background:#eef2f6;color:#1f2937;padding:2px 5px;border-radius:4px">\1</code>',
+        escaped,
+    )
+    escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
+    escaped = re.sub(r"__([^_]+)__", r"<strong>\1</strong>", escaped)
+    escaped = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<em>\1</em>", escaped)
+    escaped = re.sub(r"(?<!_)_([^_\n]+)_(?!_)", r"<em>\1</em>", escaped)
+    return escaped
+
+
+def markdown_to_email_html(markdown):
+    blocks = []
+    list_stack = []
+    in_code_block = False
+    code_lines = []
+    paragraph_lines = []
+
+    def close_paragraph():
+        if not paragraph_lines:
+            return
+        text = " ".join(line.strip() for line in paragraph_lines)
+        blocks.append(
+            '<p style="margin:0 0 16px;line-height:1.6;color:#243041">'
+            f"{render_inline_markdown(text)}</p>"
+        )
+        paragraph_lines.clear()
+
+    def close_lists(target_depth=0):
+        while len(list_stack) > target_depth:
+            tag = list_stack.pop()
+            blocks.append(f"</{tag}>")
+
+    for raw_line in markdown.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+
+        if stripped.startswith("```"):
+            close_paragraph()
+            close_lists()
+            if in_code_block:
+                blocks.append(
+                    '<pre style="margin:0 0 16px;padding:14px 16px;background:#111827;'
+                    'color:#f9fafb;border-radius:8px;overflow:auto;white-space:pre-wrap;'
+                    'font-family:Menlo,Consolas,monospace;font-size:13px;line-height:1.5">'
+                    f"{html.escape(chr(10).join(code_lines))}</pre>"
+                )
+                code_lines.clear()
+                in_code_block = False
+            else:
+                in_code_block = True
+            continue
+
+        if in_code_block:
+            code_lines.append(line)
+            continue
+
+        if not stripped:
+            close_paragraph()
+            close_lists()
+            continue
+
+        heading = re.match(r"^(#{1,3})\s+(.+)$", stripped)
+        if heading:
+            close_paragraph()
+            close_lists()
+            level = len(heading.group(1))
+            size = {1: 24, 2: 20, 3: 17}[level]
+            margin = "0 0 14px" if level == 1 else "22px 0 10px"
+            blocks.append(
+                f'<h{level} style="margin:{margin};font-size:{size}px;line-height:1.25;'
+                'font-weight:700;color:#111827">'
+                f"{render_inline_markdown(heading.group(2).strip())}</h{level}>"
+            )
+            continue
+
+        list_item = re.match(r"^(\s*)([-*]|\d+[.])\s+(.+)$", line)
+        if list_item:
+            close_paragraph()
+            indent = len(list_item.group(1).replace("\t", "    "))
+            depth = indent // 2
+            tag = "ol" if list_item.group(2).endswith(".") else "ul"
+            while len(list_stack) > depth:
+                blocks.append(f"</{list_stack.pop()}>")
+            if len(list_stack) == depth or list_stack[-1] != tag:
+                if len(list_stack) > depth:
+                    blocks.append(f"</{list_stack.pop()}>")
+                blocks.append(
+                    f'<{tag} style="margin:0 0 16px 22px;padding:0;line-height:1.55;color:#243041">'
+                )
+                list_stack.append(tag)
+            blocks.append(
+                '<li style="margin:0 0 8px">'
+                f"{render_inline_markdown(list_item.group(3).strip())}</li>"
+            )
+            continue
+
+        close_lists()
+        paragraph_lines.append(line)
+
+    close_paragraph()
+    close_lists()
+    if in_code_block:
+        blocks.append(
+            '<pre style="margin:0 0 16px;padding:14px 16px;background:#111827;'
+            'color:#f9fafb;border-radius:8px;overflow:auto;white-space:pre-wrap;'
+            'font-family:Menlo,Consolas,monospace;font-size:13px;line-height:1.5">'
+            f"{html.escape(chr(10).join(code_lines))}</pre>"
+        )
+    return "\n".join(blocks)
+
+
+def build_email_html(subject, body):
+    content = markdown_to_email_html(body)
+    escaped_subject = html.escape(subject)
+    return f"""<!doctype html>
+<html>
+  <body style="margin:0;padding:0;background:#f4f7fb;font-family:Arial,Helvetica,sans-serif;color:#243041">
+    <div style="display:none;max-height:0;overflow:hidden;color:#f4f7fb;opacity:0">
+      {escaped_subject}
+    </div>
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;background:#f4f7fb">
+      <tr>
+        <td align="center" style="padding:28px 14px">
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;max-width:760px;background:#ffffff;border:1px solid #dbe3ee;border-radius:10px;overflow:hidden">
+            <tr>
+              <td style="padding:24px 28px;background:#172033;color:#ffffff">
+                <div style="font-size:13px;letter-spacing:0;text-transform:uppercase;color:#a9d4ff;font-weight:700">OpenFang News</div>
+                <h1 style="margin:8px 0 0;font-size:24px;line-height:1.25;font-weight:700;color:#ffffff">{escaped_subject}</h1>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:28px">
+                {content}
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>"""
+
+
 def make_email(subject, body, recipients, sender):
     message = EmailMessage()
     message["Subject"] = subject
@@ -386,15 +556,68 @@ def make_email(subject, body, recipients, sender):
     message["To"] = ", ".join(recipients)
     message.set_content(body)
 
-    html_body = "<br>".join(html.escape(line) for line in body.splitlines())
-    message.add_alternative(
-        f"<html><body><pre style=\"font-family:Arial,sans-serif;white-space:pre-wrap\">{html_body}</pre></body></html>",
-        subtype="html",
-    )
+    message.add_alternative(build_email_html(subject, body), subtype="html")
     return message
 
 
-def send_email(body):
+def make_mailersend_email(subject, body, recipients, sender, sender_name=""):
+    from_address = {"email": sender}
+    if sender_name:
+        from_address["name"] = sender_name
+
+    return {
+        "from": from_address,
+        "to": [{"email": recipient} for recipient in recipients],
+        "subject": subject,
+        "text": body,
+        "html": build_email_html(subject, body),
+    }
+
+
+def send_mailersend_email(subject, body):
+    recipients = env_list("MAILERSEND_TO", MAILERSEND_TO)
+    if not recipients:
+        raise RuntimeError("Set MAILERSEND_TO or SMTP_TO to one or more comma-separated recipient emails.")
+    if not MAILERSEND_API_KEY:
+        raise RuntimeError("Set MAILERSEND_API_KEY for MailerSend.")
+    if not MAILERSEND_FROM:
+        raise RuntimeError("Set MAILERSEND_FROM or SMTP_FROM for the MailerSend sender address.")
+
+    for recipient in recipients:
+        payload = make_mailersend_email(
+            subject,
+            body,
+            [recipient],
+            MAILERSEND_FROM,
+            MAILERSEND_FROM_NAME,
+        )
+        request = urllib.request.Request(
+            MAILERSEND_API_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {MAILERSEND_API_KEY}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "User-Agent": MAILERSEND_USER_AGENT,
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=45) as response:
+                if response.status not in (200, 202):
+                    response_body = response.read().decode("utf-8", errors="replace")
+                    raise RuntimeError(f"MailerSend returned HTTP {response.status}: {response_body}")
+        except urllib.error.HTTPError as exc:
+            response_body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"MailerSend failed for {recipient} with HTTP {exc.code}: {response_body}"
+            ) from exc
+
+    return recipients
+
+
+def send_smtp_email(subject, body):
     recipients = env_list("SMTP_TO", SMTP_TO)
     if not recipients:
         raise RuntimeError("Set SMTP_TO to one or more comma-separated recipient emails.")
@@ -403,7 +626,6 @@ def send_email(body):
     if not SMTP_FROM:
         raise RuntimeError("Set SMTP_FROM or SMTP_USER for the sender address.")
 
-    subject = f"Daily Cybersecurity News - {datetime.now().strftime('%Y-%m-%d')}"
     message = make_email(subject, body, recipients, SMTP_FROM)
 
     context = ssl.create_default_context()
@@ -415,6 +637,21 @@ def send_email(body):
     return recipients
 
 
+def selected_mail_provider():
+    provider = MAIL_PROVIDER or ("mailersend" if MAILERSEND_API_KEY else "smtp")
+    if provider not in {"mailersend", "smtp"}:
+        raise RuntimeError("Set MAIL_PROVIDER to either 'mailersend' or 'smtp'.")
+    return provider
+
+
+def send_email(body, subject=None):
+    subject = subject or f"Daily Cybersecurity News - {datetime.now().strftime('%Y-%m-%d')}"
+    provider = selected_mail_provider()
+    if provider == "mailersend":
+        return send_mailersend_email(subject, body)
+    return send_smtp_email(subject, body)
+
+
 def generate_digest():
     try:
         return run_ollama_web_search_agent()
@@ -422,6 +659,7 @@ def generate_digest():
         RuntimeError,
         ollama.RequestError,
         ollama.ResponseError,
+        ConnectionError,
         TypeError,
         ValueError,
         urllib.error.URLError,
@@ -434,6 +672,7 @@ def generate_digest():
             RuntimeError,
             ollama.RequestError,
             ollama.ResponseError,
+            ConnectionError,
             TypeError,
             ValueError,
             urllib.error.URLError,
@@ -455,18 +694,19 @@ def run_once(dry_run=False):
 
 
 def run_test_send_mail():
-    LOGGER.info("test_send_mail_start provider=smtp")
+    provider = selected_mail_provider()
+    LOGGER.info("test_send_mail_start provider=%s", provider)
     body = "\n".join(
         [
             "OpenFang News test email",
             "",
             f"Sent at: {datetime.now().isoformat(timespec='seconds')}",
-            "Provider: smtp",
+            f"Provider: {provider}",
             "",
             "If you received this, the email sending path is configured correctly.",
         ]
     )
-    recipients = send_email(body)
+    recipients = send_email(body, "OpenFang News test email")
     LOGGER.info("test_send_mail_complete recipients=%s", recipients)
     print(f"Sent test email to {', '.join(recipients)}")
 
@@ -522,4 +762,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
