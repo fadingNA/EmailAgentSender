@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import csv
 import sys
 import html
 import json
@@ -16,6 +17,8 @@ from email.message import EmailMessage
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
+
+from data.app_vendors import collect_cached_app_vendors, format_vendor_context
 
 
 def load_dotenv(path=".env"):
@@ -56,12 +59,27 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
 
+DEFAULT_APP_VENDOR_DATA_DIR = Path(__file__).resolve().parent / "data"
+DEFAULT_APP_VENDOR_CACHE_PATH = DEFAULT_APP_VENDOR_DATA_DIR / ".cache" / "app_vendors.json"
 DIGEST_TOPIC = os.getenv("DIGEST_TOPIC", "latest cybersecurity news")
 DIGEST_MAX_ITEMS = int(os.getenv("DIGEST_MAX_ITEMS", "12"))
+GENERAL_SECURITY_MAX_ITEMS = int(os.getenv("GENERAL_SECURITY_MAX_ITEMS", "15"))
 DIGEST_TIME = os.getenv("DIGEST_TIME", "08:00")
 OLLAMA_TOOL_ITERATIONS = int(os.getenv("OLLAMA_TOOL_ITERATIONS", "6"))
+APP_VENDOR_DATA_DIR = os.getenv("APP_VENDOR_DATA_DIR", str(DEFAULT_APP_VENDOR_DATA_DIR))
+APP_VENDOR_COLUMN = os.getenv("APP_VENDOR_COLUMN", "app_vendor")
+APP_VENDOR_LIMIT = int(os.getenv("APP_VENDOR_LIMIT", "50"))
+APP_VENDOR_CACHE_PATH = os.getenv("APP_VENDOR_CACHE_PATH", str(DEFAULT_APP_VENDOR_CACHE_PATH))
+WEB_SEARCH_RESULT_LIMIT = int(
+    os.getenv(
+        "WEB_SEARCH_RESULT_LIMIT",
+        str(max(DIGEST_MAX_ITEMS, GENERAL_SECURITY_MAX_ITEMS + min(APP_VENDOR_LIMIT, 50))),
+    )
+)
 LOG_FILE = os.getenv("LOG_FILE", "logs/news_digest.log")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+APP_VENDOR_REFRESH_CACHE = False
+APP_VENDOR_CONTEXT_CACHE = None
 
 
 def setup_logger():
@@ -178,6 +196,65 @@ def web_search(query: str, max_results: int = 5):
     return response
 
 
+def get_app_vendor_context():
+    global APP_VENDOR_REFRESH_CACHE, APP_VENDOR_CONTEXT_CACHE
+
+    if APP_VENDOR_CONTEXT_CACHE is not None and not APP_VENDOR_REFRESH_CACHE:
+        return APP_VENDOR_CONTEXT_CACHE
+
+    try:
+        vendors = collect_cached_app_vendors(
+            data_dir=Path(APP_VENDOR_DATA_DIR),
+            column_name=APP_VENDOR_COLUMN,
+            limit=APP_VENDOR_LIMIT,
+            cache_path=Path(APP_VENDOR_CACHE_PATH),
+            refresh_cache=APP_VENDOR_REFRESH_CACHE,
+        )
+    except (OSError, csv.Error, UnicodeDecodeError) as exc:
+        LOGGER.warning("app_vendor_context_failed error=%s", exc)
+        vendors = []
+    APP_VENDOR_REFRESH_CACHE = False
+    APP_VENDOR_CONTEXT_CACHE = vendors, format_vendor_context(vendors)
+    LOGGER.info("app_vendor_context_count count=%s", len(vendors))
+    return APP_VENDOR_CONTEXT_CACHE
+
+
+def digest_date_window():
+    today = datetime.now()
+    yesterday = today - timedelta(days=1)
+    return (
+        today.strftime("%B %d, %Y"),
+        yesterday.strftime("%B %d, %Y"),
+    )
+
+
+def digest_format_instructions(has_app_vendors=False):
+    vendor_section = (
+        "## 2. Targeted Vendor Watch - All Relevant Matches\n"
+        "Cover the targeted vendors supplied below. Include every relevant current "
+        "match you found for those vendors without a top-N display limit. Group by "
+        "vendor when possible. If a targeted vendor has no current finding in the "
+        "available sources, omit that vendor instead of inventing a finding.\n\n"
+        if has_app_vendors
+        else "## 2. Targeted Vendor Watch - All Relevant Matches\nNo targeted vendor list was available.\n\n"
+    )
+    return (
+        "Use this exact markdown structure:\n\n"
+        "# Cybersecurity Briefing\n"
+        "## Executive Snapshot\n"
+        "Write 3-5 bullets with the most important takeaways.\n\n"
+        f"## 1. General Company Security - Top {GENERAL_SECURITY_MAX_ITEMS} (Today & Yesterday)\n"
+        f"List up to {GENERAL_SECURITY_MAX_ITEMS} important general cybersecurity stories from today and yesterday. "
+        "Use a numbered list. Each item must name the company, product, or organization, explain why it matters, "
+        "and include a source link.\n\n"
+        f"{vendor_section}"
+        "## Defensive Actions\n"
+        "Write concise recommended actions for defenders.\n\n"
+        "## References\n"
+        "List every source title and URL used."
+    )
+
+
 def run_ollama_web_search_agent():
     LOGGER.info(
         "digest_tool_agent_start model=%r topic=%r max_items=%s",
@@ -186,7 +263,8 @@ def run_ollama_web_search_agent():
         DIGEST_MAX_ITEMS,
     )
     client = ollama_client()
-    today = datetime.now().strftime("%B %d, %Y")
+    today, yesterday = digest_date_window()
+    app_vendors, app_vendor_context = get_app_vendor_context()
     tools = [web_search]
     available_tools = {
         "web_search": web_search,
@@ -201,19 +279,27 @@ def run_ollama_web_search_agent():
                 "results as factual sources. Include "
                 "source links for every important claim in the final digest and "
                 "finish with a References section listing the title and URL of each "
-                "source used."
+                "source used. Focus on events from today and yesterday."
             ),
         },
         {
             "role": "user",
             "content": (
-                f"Today is {today}. Create a daily briefing about {DIGEST_TOPIC}. "
-                "Freely search the web for the latest important cybersecurity "
-                f"news. Try multiple useful queries if needed and use up to "
-                f"{DIGEST_MAX_ITEMS} strong results. Format the final answer with: "
-                "1. Executive summary, 3-5 bullets. 2. Top stories, each with why "
-                "it matters and source links. 3. Recommended defensive actions. "
-                "4. References."
+                f"Today is {today}. Yesterday was {yesterday}. Create a daily "
+                f"briefing about {DIGEST_TOPIC}. Search for two groups: "
+                f"1. the top {GENERAL_SECURITY_MAX_ITEMS} general company security stories "
+                "from today and yesterday; 2. targeted vendor cybersecurity findings "
+                "for the supplied app vendors with no artificial display limit. "
+                "Use multiple useful queries if needed.\n\n"
+                f"{digest_format_instructions(bool(app_vendors))}"
+                + (
+                    "\n\nAdditional vendor focus: Search for recent cybersecurity "
+                    "news, vulnerabilities, breaches, advisories, and threat activity "
+                    f"related to these non-duplicated app vendors: {app_vendor_context}. "
+                    "Prioritize vendor-specific findings when they are current and relevant."
+                    if app_vendors
+                    else ""
+                )
             ),
         },
     ]
@@ -260,7 +346,8 @@ def run_ollama_web_search_agent():
 
 
 def generate_search_queries():
-    today = datetime.now().strftime("%B %d, %Y")
+    today, yesterday = digest_date_window()
+    app_vendors, app_vendor_context = get_app_vendor_context()
     LOGGER.info(
         "query_planner_start model=%r topic=%r max_items=%s",
         OLLAMA_MODEL,
@@ -281,9 +368,17 @@ def generate_search_queries():
                 "role": "user",
                 "content": (
                     f"Today is {today}. Create diverse web search queries for "
-                    f"finding {DIGEST_TOPIC}. Include breaking cybersecurity news, "
-                    "ransomware, vulnerability exploitation, data breaches, and "
-                    "government/vendor advisories where relevant."
+                    f"finding {DIGEST_TOPIC} from today and yesterday ({yesterday}). "
+                    f"Include queries for the top {GENERAL_SECURITY_MAX_ITEMS} general "
+                    "company security stories, ransomware, exploited vulnerabilities, "
+                    "data breaches, and government/vendor advisories."
+                    + (
+                        "\n\nAlso include targeted queries for recent cybersecurity "
+                        "issues involving these non-duplicated app vendors: "
+                        f"{app_vendor_context}."
+                        if app_vendors
+                        else ""
+                    )
                 ),
             },
         ]
@@ -295,15 +390,16 @@ def generate_search_queries():
             queries.append(query)
     if not queries:
         raise RuntimeError("Ollama did not produce any web search queries.")
-    for query in queries[:4]:
+    query_limit = 8 if app_vendors else 5
+    for query in queries[:query_limit]:
         LOGGER.info("query_planner_query query=%r", query)
-    return queries[:4]
+    return queries[:query_limit]
 
 
 def collect_ollama_web_search_results(queries):
     seen = set()
     results = []
-    per_query = max(1, min(10, DIGEST_MAX_ITEMS // max(1, len(queries)) + 1))
+    per_query = max(1, min(10, WEB_SEARCH_RESULT_LIMIT // max(1, len(queries)) + 2))
     for query in queries:
         response = web_search(query=query, max_results=per_query)
         for result in response.results:
@@ -319,7 +415,7 @@ def collect_ollama_web_search_results(queries):
                     "content": result.content,
                 }
             )
-            if len(results) >= DIGEST_MAX_ITEMS:
+            if len(results) >= WEB_SEARCH_RESULT_LIMIT:
                 return results
     return results
 
@@ -341,7 +437,8 @@ def summarize_search_results(results):
             )
         )
 
-    today = datetime.now().strftime("%B %d, %Y")
+    today, yesterday = digest_date_window()
+    app_vendors, _ = get_app_vendor_context()
     return ollama_chat(
         [
             {
@@ -357,11 +454,9 @@ def summarize_search_results(results):
             {
                 "role": "user",
                 "content": (
-                    f"Today is {today}. Create a daily briefing about {DIGEST_TOPIC}.\n\n"
+                    f"Today is {today}. Yesterday was {yesterday}. Create a daily briefing about {DIGEST_TOPIC}.\n\n"
                     f"{chr(10).join(lines)}\n\n"
-                    "Format the final answer with: 1. Executive summary, 3-5 bullets. "
-                    "2. Top stories, each with why it matters and a source link. "
-                    "3. Recommended defensive actions. 4. References."
+                    f"{digest_format_instructions(bool(app_vendors))}"
                 ),
             },
         ]
@@ -399,14 +494,14 @@ def render_inline_markdown(text):
             return match.group(0)
         return (
             f'<a href="{html.escape(url, quote=True)}" '
-            'style="color:#0969da;text-decoration:none;font-weight:600">'
+            'style="color:#155eef;text-decoration:none;font-weight:700">'
             f"{label}</a>"
         )
 
     escaped = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", replace_link, escaped)
     escaped = re.sub(
         r"`([^`]+)`",
-        r'<code style="font-family:Menlo,Consolas,monospace;font-size:13px;background:#eef2f6;color:#1f2937;padding:2px 5px;border-radius:4px">\1</code>',
+        r'<code style="font-family:Menlo,Consolas,monospace;font-size:13px;background:#edf2f7;color:#243041;padding:2px 5px;border-radius:4px">\1</code>',
         escaped,
     )
     escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
@@ -428,7 +523,7 @@ def markdown_to_email_html(markdown):
             return
         text = " ".join(line.strip() for line in paragraph_lines)
         blocks.append(
-            '<p style="margin:0 0 16px;line-height:1.6;color:#243041">'
+            '<p style="margin:0 0 16px;line-height:1.62;color:#334155;font-size:15px">'
             f"{render_inline_markdown(text)}</p>"
         )
         paragraph_lines.clear()
@@ -472,13 +567,27 @@ def markdown_to_email_html(markdown):
             close_paragraph()
             close_lists()
             level = len(heading.group(1))
-            size = {1: 24, 2: 20, 3: 17}[level]
-            margin = "0 0 14px" if level == 1 else "22px 0 10px"
-            blocks.append(
-                f'<h{level} style="margin:{margin};font-size:{size}px;line-height:1.25;'
-                'font-weight:700;color:#111827">'
-                f"{render_inline_markdown(heading.group(2).strip())}</h{level}>"
-            )
+            heading_text = render_inline_markdown(heading.group(2).strip())
+            if level == 1:
+                blocks.append(
+                    '<h1 style="margin:0 0 18px;font-size:25px;line-height:1.22;'
+                    'font-weight:800;color:#0f172a">'
+                    f"{heading_text}</h1>"
+                )
+            elif level == 2:
+                blocks.append(
+                    '<div style="margin:26px 0 14px;padding:13px 16px;'
+                    'background:#f7fafc;border:1px solid #dbe5ef;border-left:4px solid #155eef;'
+                    'border-radius:8px">'
+                    '<h2 style="margin:0;font-size:18px;line-height:1.3;font-weight:800;color:#0f172a">'
+                    f"{heading_text}</h2></div>"
+                )
+            else:
+                blocks.append(
+                    '<h3 style="margin:20px 0 10px;font-size:16px;line-height:1.3;'
+                    'font-weight:800;color:#1e293b">'
+                    f"{heading_text}</h3>"
+                )
             continue
 
         list_item = re.match(r"^(\s*)([-*]|\d+[.])\s+(.+)$", line)
@@ -492,12 +601,23 @@ def markdown_to_email_html(markdown):
             if len(list_stack) == depth or list_stack[-1] != tag:
                 if len(list_stack) > depth:
                     blocks.append(f"</{list_stack.pop()}>")
+                list_style = (
+                    "margin:0 0 18px;padding:0;line-height:1.55;color:#334155;list-style-position:inside"
+                    if depth == 0
+                    else "margin:8px 0 14px 18px;padding:0;line-height:1.55;color:#334155"
+                )
                 blocks.append(
-                    f'<{tag} style="margin:0 0 16px 22px;padding:0;line-height:1.55;color:#243041">'
+                    f'<{tag} style="{list_style}">'
                 )
                 list_stack.append(tag)
+            item_style = (
+                "margin:0 0 10px;padding:12px 14px;background:#ffffff;"
+                "border:1px solid #e2e8f0;border-radius:8px;color:#334155"
+                if depth == 0
+                else "margin:0 0 8px;color:#334155"
+            )
             blocks.append(
-                '<li style="margin:0 0 8px">'
+                f'<li style="{item_style}">'
                 f"{render_inline_markdown(list_item.group(3).strip())}</li>"
             )
             continue
@@ -520,24 +640,37 @@ def markdown_to_email_html(markdown):
 def build_email_html(subject, body):
     content = markdown_to_email_html(body)
     escaped_subject = html.escape(subject)
+    generated_at = html.escape(datetime.now().strftime("%B %d, %Y"))
     return f"""<!doctype html>
 <html>
-  <body style="margin:0;padding:0;background:#f4f7fb;font-family:Arial,Helvetica,sans-serif;color:#243041">
-    <div style="display:none;max-height:0;overflow:hidden;color:#f4f7fb;opacity:0">
+  <body style="margin:0;padding:0;background:#edf2f7;font-family:Arial,Helvetica,sans-serif;color:#243041">
+    <div style="display:none;max-height:0;overflow:hidden;color:#edf2f7;opacity:0">
       {escaped_subject}
     </div>
-    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;background:#f4f7fb">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;background:#edf2f7">
       <tr>
-        <td align="center" style="padding:28px 14px">
-          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;max-width:760px;background:#ffffff;border:1px solid #dbe3ee;border-radius:10px;overflow:hidden">
+        <td align="center" style="padding:30px 14px">
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;max-width:820px;background:#ffffff;border:1px solid #d8e2ec;border-radius:8px;overflow:hidden;box-shadow:0 14px 38px rgba(15,23,42,0.08)">
             <tr>
-              <td style="padding:24px 28px;background:#172033;color:#ffffff">
-                <div style="font-size:13px;letter-spacing:0;text-transform:uppercase;color:#a9d4ff;font-weight:700">OpenFang News</div>
-                <h1 style="margin:8px 0 0;font-size:24px;line-height:1.25;font-weight:700;color:#ffffff">{escaped_subject}</h1>
+              <td style="padding:26px 30px;background:#111827;color:#ffffff;border-bottom:4px solid #2dd4bf">
+                <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse">
+                  <tr>
+                    <td style="vertical-align:top">
+                      <div style="font-size:12px;letter-spacing:0.08em;text-transform:uppercase;color:#8bd3ff;font-weight:800">OpenFang News</div>
+                      <h1 style="margin:8px 0 0;font-size:26px;line-height:1.22;font-weight:800;color:#ffffff">{escaped_subject}</h1>
+                    </td>
+                    <td align="right" style="vertical-align:top;white-space:nowrap">
+                      <span style="display:inline-block;padding:7px 10px;border:1px solid rgba(255,255,255,0.24);border-radius:8px;color:#dbeafe;font-size:12px;font-weight:700">{generated_at}</span>
+                    </td>
+                  </tr>
+                </table>
+                <p style="margin:14px 0 0;color:#cbd5e1;font-size:14px;line-height:1.55">
+                  Top company security stories from today and yesterday, plus targeted vendor intelligence from your app inventory.
+                </p>
               </td>
             </tr>
             <tr>
-              <td style="padding:28px">
+              <td style="padding:30px;background:#fbfdff">
                 {content}
               </td>
             </tr>
@@ -741,6 +874,8 @@ def print_cron(time_hhmm):
 
 
 def main():
+    global APP_VENDOR_REFRESH_CACHE
+
     parser = argparse.ArgumentParser(
         description="Send a daily Ollama-generated cybersecurity news digest to multiple email recipients."
     )
@@ -749,7 +884,13 @@ def main():
     parser.add_argument("--daemon", action="store_true", help="Keep running and send once per day.")
     parser.add_argument("--time", default=DIGEST_TIME, help="Daily send time in 24-hour HH:MM format.")
     parser.add_argument("--print-cron", action="store_true", help="Print a crontab line for daily automation.")
+    parser.add_argument(
+        "--refresh-app-vendors",
+        action="store_true",
+        help="Rebuild the cached app_vendor list from CSV files before generating the digest.",
+    )
     args = parser.parse_args()
+    APP_VENDOR_REFRESH_CACHE = args.refresh_app_vendors
 
     if args.print_cron:
         print_cron(args.time)
