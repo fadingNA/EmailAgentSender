@@ -81,8 +81,11 @@ WEB_SEARCH_RESULT_LIMIT = int(
 )
 WEB_SEARCH_RETRIES = int(os.getenv("WEB_SEARCH_RETRIES", "2"))
 WEB_SEARCH_RETRY_DELAY_SECONDS = float(os.getenv("WEB_SEARCH_RETRY_DELAY_SECONDS", "2"))
+WEB_SEARCH_REQUEST_DELAY_SECONDS = float(os.getenv("WEB_SEARCH_REQUEST_DELAY_SECONDS", "8"))
 WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "1").lower() in {"1", "true", "yes"}
 WEB_SEARCH_STOP_TRACK_ON_EMPTY = os.getenv("WEB_SEARCH_STOP_TRACK_ON_EMPTY", "1").lower() in {"1", "true", "yes"}
+WEB_SEARCH_STOP_TRACK_ON_RATE_LIMIT = os.getenv("WEB_SEARCH_STOP_TRACK_ON_RATE_LIMIT", "1").lower() in {"1", "true", "yes"}
+WEB_SEARCH_RATE_LIMIT_COOLDOWN_SECONDS = float(os.getenv("WEB_SEARCH_RATE_LIMIT_COOLDOWN_SECONDS", "60"))
 VENDOR_SEARCH_QUERIES_PER_VENDOR = int(os.getenv("VENDOR_SEARCH_QUERIES_PER_VENDOR", "3"))
 DEFAULT_CYBERSECURITY_FEED_URLS = [
     "https://www.bleepingcomputer.com/feed/",
@@ -137,6 +140,12 @@ LOGGER = setup_logger()
 
 class EmptyWebSearchResponse(RuntimeError):
     pass
+
+
+class RateLimitedWebSearchResponse(RuntimeError):
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 def ollama_client():
@@ -203,6 +212,16 @@ def log_search_results(query, response):
         )
 
 
+def retry_after_seconds(headers):
+    raw_value = headers.get("Retry-After") if headers else None
+    if not raw_value:
+        return None
+    try:
+        return max(0.0, float(raw_value))
+    except ValueError:
+        return None
+
+
 def web_search(query: str, max_results: int = 5):
     """Search the web for current source material.
 
@@ -247,12 +266,33 @@ def web_search(query: str, max_results: int = 5):
                 )
         except urllib.error.HTTPError as exc:
             response_body = exc.read().decode("utf-8", errors="replace")
+            retry_after = retry_after_seconds(exc.headers)
             LOGGER.warning(
-                "web_search_http_error query=%r status=%s body_preview=%r",
+                "web_search_http_error query=%r status=%s retry_after=%s body_preview=%r",
                 query,
                 exc.code,
+                retry_after,
                 response_body[:500],
             )
+            if exc.code == 429:
+                cooldown = retry_after or WEB_SEARCH_RATE_LIMIT_COOLDOWN_SECONDS
+                if WEB_SEARCH_STOP_TRACK_ON_RATE_LIMIT:
+                    raise RateLimitedWebSearchResponse(
+                        f"Ollama web_search rate limited query: {query}",
+                        retry_after=cooldown,
+                    ) from exc
+                if attempt < max_attempts:
+                    LOGGER.warning(
+                        "web_search_rate_limited_retry query=%r cooldown_seconds=%.1f",
+                        query,
+                        cooldown,
+                    )
+                    time.sleep(cooldown)
+                    continue
+                raise RateLimitedWebSearchResponse(
+                    f"Ollama web_search rate limited query: {query}",
+                    retry_after=cooldown,
+                ) from exc
             if exc.code in {429, 500, 502, 503, 504} and attempt < max_attempts:
                 time.sleep(WEB_SEARCH_RETRY_DELAY_SECONDS * attempt)
                 continue
@@ -527,9 +567,32 @@ def collect_ollama_web_search_results(queries, source_group):
         len(queries),
         per_query,
     )
-    for query in queries:
+    for index, query in enumerate(queries, start=1):
+        if index > 1 and WEB_SEARCH_REQUEST_DELAY_SECONDS > 0:
+            LOGGER.info(
+                "web_search_request_pause group=%s delay_seconds=%.1f",
+                source_group,
+                WEB_SEARCH_REQUEST_DELAY_SECONDS,
+            )
+            time.sleep(WEB_SEARCH_REQUEST_DELAY_SECONDS)
         try:
             response = web_search(query=query, max_results=per_query)
+        except RateLimitedWebSearchResponse as exc:
+            LOGGER.warning(
+                "query_web_search_rate_limited group=%s query=%r retry_after=%s error=%s",
+                source_group,
+                query,
+                exc.retry_after,
+                exc,
+            )
+            if WEB_SEARCH_STOP_TRACK_ON_RATE_LIMIT:
+                LOGGER.warning(
+                    "search_track_aborted group=%s reason=web_search_rate_limited retry_after=%s",
+                    source_group,
+                    exc.retry_after,
+                )
+                break
+            continue
         except EmptyWebSearchResponse as exc:
             LOGGER.warning(
                 "query_web_search_empty group=%s query=%r error=%s",
