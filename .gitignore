@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 token.json
 credentials.json
+component/.cache/
 data/*
-!data/__init__.py
-!data/app_vendors.py
+!component/__init__.py
+!component/app_vendors.py

@@ -42,13 +42,13 @@ WEB_SEARCH_RESULT_LIMIT=65
 Preview the vendor list with:
 
 ```sh
-python3 data/app_vendors.py
+python3 component/app_vendors.py
 ```
 
 The vendor list is cached so the mail job does not rescan CSV files every run.
 Use these flags when the CSV data changes:
 
 ```sh
-python3 data/app_vendors.py --refresh-cache
+python3 component/app_vendors.py --refresh-cache
 python3 send_mail.py --refresh-app-vendors
 ```

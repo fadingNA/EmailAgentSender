@@ -7,7 +7,8 @@ import json
 from pathlib import Path
 
 
-DEFAULT_DATA_DIR = Path(__file__).resolve().parent
+DEFAULT_PROJECT_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_DATA_DIR = DEFAULT_PROJECT_DIR / "data"
 DEFAULT_VENDOR_COLUMN = "app_vendor"
 DEFAULT_VENDOR_LIMIT = 50
 DEFAULT_CACHE_PATH = DEFAULT_DATA_DIR / ".cache" / "app_vendors.json"

@@ -18,7 +18,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
 
-from data.app_vendors import collect_cached_app_vendors, format_vendor_context
+from component.app_vendors import collect_cached_app_vendors, format_vendor_context
 
 
 def load_dotenv(path=".env"):
