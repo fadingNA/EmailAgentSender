@@ -81,6 +81,7 @@ WEB_SEARCH_RESULT_LIMIT = int(
 )
 WEB_SEARCH_RETRIES = int(os.getenv("WEB_SEARCH_RETRIES", "2"))
 WEB_SEARCH_RETRY_DELAY_SECONDS = float(os.getenv("WEB_SEARCH_RETRY_DELAY_SECONDS", "2"))
+WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "1").lower() in {"1", "true", "yes"}
 WEB_SEARCH_STOP_TRACK_ON_EMPTY = os.getenv("WEB_SEARCH_STOP_TRACK_ON_EMPTY", "1").lower() in {"1", "true", "yes"}
 VENDOR_SEARCH_QUERIES_PER_VENDOR = int(os.getenv("VENDOR_SEARCH_QUERIES_PER_VENDOR", "3"))
 DEFAULT_CYBERSECURITY_FEED_URLS = [
@@ -513,6 +514,10 @@ def generate_vendor_search_queries(vendors):
 
 
 def collect_ollama_web_search_results(queries, source_group):
+    if not WEB_SEARCH_ENABLED:
+        LOGGER.info("search_track_skipped group=%s reason=web_search_disabled", source_group)
+        return []
+
     seen = set()
     results = []
     per_query = max(1, min(10, WEB_SEARCH_RESULT_LIMIT // max(1, len(queries)) + 2))
@@ -701,6 +706,12 @@ def summarize_search_results(results):
     if not results:
         return "No recent cybersecurity articles were found today."
 
+    groups = {}
+    for result in results:
+        group = result.get("group", "general")
+        groups[group] = groups.get(group, 0) + 1
+    LOGGER.info("summarize_start results=%s groups=%s", len(results), groups)
+
     lines = []
     for index, result in enumerate(results, start=1):
         lines.append(
@@ -717,7 +728,7 @@ def summarize_search_results(results):
 
     today, yesterday = digest_date_window()
     app_vendors, _ = get_app_vendor_context()
-    return ollama_chat(
+    digest = ollama_chat(
         [
             {
                 "role": "system",
@@ -744,6 +755,8 @@ def summarize_search_results(results):
             },
         ]
     )
+    LOGGER.info("summarize_complete chars=%s", len(digest))
+    return digest
 
 
 def run_ollama_query_planner_search():
