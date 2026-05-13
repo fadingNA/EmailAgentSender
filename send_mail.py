@@ -12,6 +12,7 @@ import ssl
 import time
 import urllib.error
 import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 from logging.handlers import RotatingFileHandler
@@ -58,6 +59,7 @@ MAILERSEND_USER_AGENT = os.getenv("MAILERSEND_USER_AGENT", "openfang-news/1.0")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
+OLLAMA_CHAT_TIMEOUT_SECONDS = float(os.getenv("OLLAMA_CHAT_TIMEOUT_SECONDS", "180"))
 
 DEFAULT_APP_VENDOR_DATA_DIR = Path(__file__).resolve().parent / "data"
 DEFAULT_APP_VENDOR_CACHE_PATH = DEFAULT_APP_VENDOR_DATA_DIR / ".cache" / "app_vendors.json"
@@ -66,6 +68,7 @@ DIGEST_MAX_ITEMS = int(os.getenv("DIGEST_MAX_ITEMS", "12"))
 GENERAL_SECURITY_MAX_ITEMS = int(os.getenv("GENERAL_SECURITY_MAX_ITEMS", "15"))
 DIGEST_TIME = os.getenv("DIGEST_TIME", "08:00")
 OLLAMA_TOOL_ITERATIONS = int(os.getenv("OLLAMA_TOOL_ITERATIONS", "6"))
+ENABLE_TOOL_AGENT_FALLBACK = os.getenv("ENABLE_TOOL_AGENT_FALLBACK", "0").lower() in {"1", "true", "yes"}
 APP_VENDOR_DATA_DIR = os.getenv("APP_VENDOR_DATA_DIR", str(DEFAULT_APP_VENDOR_DATA_DIR))
 APP_VENDOR_COLUMN = os.getenv("APP_VENDOR_COLUMN", "app_vendor")
 APP_VENDOR_LIMIT = int(os.getenv("APP_VENDOR_LIMIT", "50"))
@@ -76,8 +79,27 @@ WEB_SEARCH_RESULT_LIMIT = int(
         str(max(DIGEST_MAX_ITEMS, GENERAL_SECURITY_MAX_ITEMS + min(APP_VENDOR_LIMIT, 50))),
     )
 )
+WEB_SEARCH_RETRIES = int(os.getenv("WEB_SEARCH_RETRIES", "2"))
+WEB_SEARCH_RETRY_DELAY_SECONDS = float(os.getenv("WEB_SEARCH_RETRY_DELAY_SECONDS", "2"))
+WEB_SEARCH_STOP_TRACK_ON_EMPTY = os.getenv("WEB_SEARCH_STOP_TRACK_ON_EMPTY", "1").lower() in {"1", "true", "yes"}
+VENDOR_SEARCH_QUERIES_PER_VENDOR = int(os.getenv("VENDOR_SEARCH_QUERIES_PER_VENDOR", "3"))
+DEFAULT_CYBERSECURITY_FEED_URLS = [
+    "https://www.bleepingcomputer.com/feed/",
+    "https://feeds.feedburner.com/TheHackersNews",
+    "https://www.securityweek.com/feed/",
+    "https://www.cisa.gov/cybersecurity-advisories/all.xml",
+]
+CYBERSECURITY_FEED_URLS = [
+    url.strip()
+    for url in os.getenv(
+        "CYBERSECURITY_FEED_URLS",
+        ",".join(DEFAULT_CYBERSECURITY_FEED_URLS),
+    ).split(",")
+    if url.strip()
+]
 LOG_FILE = os.getenv("LOG_FILE", "logs/news_digest.log")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_TO_CONSOLE = os.getenv("LOG_TO_CONSOLE", "1").lower() not in {"0", "false", "no"}
 APP_VENDOR_REFRESH_CACHE = False
 APP_VENDOR_CONTEXT_CACHE = None
 
@@ -90,24 +112,34 @@ def setup_logger():
     if logger.handlers:
         return logger
 
-    handler = RotatingFileHandler(
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+
+    file_handler = RotatingFileHandler(
         log_path,
         maxBytes=2_000_000,
         backupCount=5,
         encoding="utf-8",
     )
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
-    )
-    logger.addHandler(handler)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+
+    if LOG_TO_CONSOLE:
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+
     return logger
 
 
 LOGGER = setup_logger()
 
 
+class EmptyWebSearchResponse(RuntimeError):
+    pass
+
+
 def ollama_client():
-    return ollama.Client(host=OLLAMA_HOST)
+    return ollama.Client(host=OLLAMA_HOST, timeout=OLLAMA_CHAT_TIMEOUT_SECONDS)
 
 
 def env_list(name, default=""):
@@ -117,13 +149,27 @@ def env_list(name, default=""):
 
 def ollama_chat(messages):
     client = ollama_client()
+    start = time.monotonic()
+    LOGGER.info(
+        "ollama_chat_start model=%r host=%r messages=%s",
+        OLLAMA_MODEL,
+        OLLAMA_HOST,
+        len(messages),
+    )
     response = client.chat(
         model=OLLAMA_MODEL,
         messages=messages,
         stream=False,
         options={"temperature": 0.2},
     )
-    return response["message"]["content"].strip()
+    content = response["message"]["content"].strip()
+    LOGGER.info(
+        "ollama_chat_complete model=%r duration_seconds=%.1f chars=%s",
+        OLLAMA_MODEL,
+        time.monotonic() - start,
+        len(content),
+    )
+    return content
 
 
 def message_value(message, key, default=None):
@@ -166,21 +212,78 @@ def web_search(query: str, max_results: int = 5):
     if not OLLAMA_API_KEY:
         raise RuntimeError("Set OLLAMA_API_KEY for Ollama web search.")
 
-    LOGGER.info("web_search_start query=%r max_results=%s", query, max_results)
     payload = json.dumps(
         {"query": query, "max_results": min(int(max_results), 10)}
     ).encode("utf-8")
-    request = urllib.request.Request(
-        "https://ollama.com/api/web_search",
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {OLLAMA_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=45) as http_response:
-        data = json.loads(http_response.read().decode("utf-8"))
+    data = None
+    max_attempts = WEB_SEARCH_RETRIES + 1
+
+    for attempt in range(1, max_attempts + 1):
+        LOGGER.info(
+            "web_search_start query=%r max_results=%s attempt=%s max_attempts=%s",
+            query,
+            max_results,
+            attempt,
+            max_attempts,
+        )
+        request = urllib.request.Request(
+            "https://ollama.com/api/web_search",
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {OLLAMA_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=45) as http_response:
+                response_body = http_response.read().decode("utf-8", errors="replace")
+                LOGGER.info(
+                    "web_search_response query=%r status=%s bytes=%s",
+                    query,
+                    http_response.status,
+                    len(response_body),
+                )
+        except urllib.error.HTTPError as exc:
+            response_body = exc.read().decode("utf-8", errors="replace")
+            LOGGER.warning(
+                "web_search_http_error query=%r status=%s body_preview=%r",
+                query,
+                exc.code,
+                response_body[:500],
+            )
+            if exc.code in {429, 500, 502, 503, 504} and attempt < max_attempts:
+                time.sleep(WEB_SEARCH_RETRY_DELAY_SECONDS * attempt)
+                continue
+            raise
+
+        if not response_body.strip():
+            LOGGER.warning("web_search_empty_response query=%r attempt=%s", query, attempt)
+            if attempt < max_attempts:
+                time.sleep(WEB_SEARCH_RETRY_DELAY_SECONDS * attempt)
+                continue
+            raise EmptyWebSearchResponse(f"Ollama web_search returned an empty response for query: {query}")
+
+        try:
+            data = json.loads(response_body)
+            break
+        except json.JSONDecodeError as exc:
+            LOGGER.warning(
+                "web_search_invalid_json query=%r attempt=%s body_preview=%r error=%s",
+                query,
+                attempt,
+                response_body[:500],
+                exc,
+            )
+            if attempt < max_attempts:
+                time.sleep(WEB_SEARCH_RETRY_DELAY_SECONDS * attempt)
+                continue
+            raise RuntimeError(
+                f"Ollama web_search returned invalid JSON for query {query!r}: {exc}"
+            ) from exc
+
+    if data is None:
+        raise RuntimeError(f"Ollama web_search did not return data for query: {query}")
 
     response = SimpleNamespace(
         results=[
@@ -193,6 +296,7 @@ def web_search(query: str, max_results: int = 5):
         ]
     )
     log_search_results(query, response)
+    LOGGER.info("web_search_complete query=%r results=%s", query, len(response.results))
     return response
 
 
@@ -246,10 +350,24 @@ def digest_format_instructions(has_app_vendors=False):
         f"## 1. General Company Security - Top {GENERAL_SECURITY_MAX_ITEMS} (Today & Yesterday)\n"
         f"List up to {GENERAL_SECURITY_MAX_ITEMS} important general cybersecurity stories from today and yesterday. "
         "Use a numbered list. Each item must name the company, product, or organization, explain why it matters, "
-        "and include a source link.\n\n"
+        "and include a source link. For vulnerability or patch stories, include granular technical details: "
+        "affected product/component, CVE IDs when available, CVSS score/severity when available, vulnerability "
+        "class, attack vector, exploitation status, impact, fixed version or mitigation, and patch priority. "
+        "If a story includes multiple critical CVEs, include a markdown table with one CVE or one affected "
+        "product per row instead of compressing details into prose.\n\n"
         f"{vendor_section}"
+        "For every vendor finding, provide the most granular details the sources support: affected product, "
+        "affected versions if stated, CVE ID, CVSS score, vulnerability type, impact, exploitation status, "
+        "patched version or workaround, and an operational defender action. Use `Not stated` instead of "
+        "guessing when a detail is unavailable.\n\n"
+        "Markdown table rules:\n"
+        "- Put the header row, separator row, and every data row on separate lines.\n"
+        "- Do not put a complete table on one line.\n"
+        "- Use standard pipe-table syntax only, for example `| Product | CVE ID | CVSS | Impact | Action |`.\n"
+        "- Keep table cells concise so the email renderer can display them cleanly.\n\n"
         "## Defensive Actions\n"
-        "Write concise recommended actions for defenders.\n\n"
+        "Write concise recommended actions for defenders. Group actions by priority and mention the product "
+        "or CVE each action addresses when possible.\n\n"
         "## References\n"
         "List every source title and URL used."
     )
@@ -304,13 +422,25 @@ def run_ollama_web_search_agent():
         },
     ]
 
-    for _ in range(OLLAMA_TOOL_ITERATIONS):
+    for iteration in range(1, OLLAMA_TOOL_ITERATIONS + 1):
+        LOGGER.info(
+            "tool_agent_iteration_start iteration=%s max_iterations=%s messages=%s",
+            iteration,
+            OLLAMA_TOOL_ITERATIONS,
+            len(messages),
+        )
+        start = time.monotonic()
         response = client.chat(
             model=OLLAMA_MODEL,
             messages=messages,
             tools=tools,
             stream=False,
             options={"temperature": 0.2, "num_ctx": 32768},
+        )
+        LOGGER.info(
+            "tool_agent_iteration_complete iteration=%s duration_seconds=%.1f",
+            iteration,
+            time.monotonic() - start,
         )
         message = response["message"]
         messages.append(message)
@@ -319,6 +449,7 @@ def run_ollama_web_search_agent():
         if not tool_calls:
             content = message_value(message, "content", "")
             if content:
+                LOGGER.info("tool_agent_final chars=%s", len(content.strip()))
                 return content.strip()
             break
 
@@ -345,63 +476,74 @@ def run_ollama_web_search_agent():
     raise RuntimeError("Ollama web-search agent did not produce a final digest.")
 
 
-def generate_search_queries():
+def generate_general_search_queries():
     today, yesterday = digest_date_window()
-    app_vendors, app_vendor_context = get_app_vendor_context()
-    LOGGER.info(
-        "query_planner_start model=%r topic=%r max_items=%s",
-        OLLAMA_MODEL,
-        DIGEST_TOPIC,
-        DIGEST_MAX_ITEMS,
-    )
-    content = ollama_chat(
-        [
-            {
-                "role": "system",
-                "content": (
-                    "You choose web search queries for a cybersecurity news digest. "
-                    "Return only search queries, one per line. Do not add bullets, "
-                    "numbers, explanations, or quotes."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Today is {today}. Create diverse web search queries for "
-                    f"finding {DIGEST_TOPIC} from today and yesterday ({yesterday}). "
-                    f"Include queries for the top {GENERAL_SECURITY_MAX_ITEMS} general "
-                    "company security stories, ransomware, exploited vulnerabilities, "
-                    "data breaches, and government/vendor advisories."
-                    + (
-                        "\n\nAlso include targeted queries for recent cybersecurity "
-                        "issues involving these non-duplicated app vendors: "
-                        f"{app_vendor_context}."
-                        if app_vendors
-                        else ""
-                    )
-                ),
-            },
-        ]
-    )
-    queries = []
-    for line in content.splitlines():
-        query = line.strip().lstrip("-*0123456789. ").strip()
-        if query and query not in queries:
-            queries.append(query)
-    if not queries:
-        raise RuntimeError("Ollama did not produce any web search queries.")
-    query_limit = 8 if app_vendors else 5
+    date_terms = f"{today} OR {yesterday}"
+    queries = [
+        f"{DIGEST_TOPIC} {date_terms}",
+        f"cybersecurity vulnerabilities exploited in the wild {date_terms}",
+        f"security patch advisory CVE critical {date_terms}",
+        f"ransomware breach data leak cyberattack {date_terms}",
+        f"CISA KEV exploited vulnerability {date_terms}",
+        f"Microsoft Adobe SAP Cisco VMware security update {date_terms}",
+    ]
+    query_limit = min(len(queries), max(5, GENERAL_SECURITY_MAX_ITEMS // 2))
     for query in queries[:query_limit]:
-        LOGGER.info("query_planner_query query=%r", query)
+        LOGGER.info("general_search_query query=%r", query)
     return queries[:query_limit]
 
 
-def collect_ollama_web_search_results(queries):
+def generate_vendor_search_queries(vendors):
+    today, yesterday = digest_date_window()
+    queries = []
+    for vendor in vendors:
+        vendor_name = str(vendor).strip()
+        if not vendor_name:
+            continue
+        vendor_queries = [
+            f"{vendor_name} security advisory CVE {today} {yesterday}",
+            f"{vendor_name} vulnerability patch exploit {today} {yesterday}",
+            f"{vendor_name} cyberattack breach ransomware {today} {yesterday}",
+        ]
+        queries.extend(vendor_queries[:VENDOR_SEARCH_QUERIES_PER_VENDOR])
+    deduped_queries = list(dict.fromkeys(queries))
+    for query in deduped_queries:
+        LOGGER.info("vendor_search_query query=%r", query)
+    return deduped_queries
+
+
+def collect_ollama_web_search_results(queries, source_group):
     seen = set()
     results = []
     per_query = max(1, min(10, WEB_SEARCH_RESULT_LIMIT // max(1, len(queries)) + 2))
+    LOGGER.info(
+        "search_track_start group=%s queries=%s per_query=%s",
+        source_group,
+        len(queries),
+        per_query,
+    )
     for query in queries:
-        response = web_search(query=query, max_results=per_query)
+        try:
+            response = web_search(query=query, max_results=per_query)
+        except EmptyWebSearchResponse as exc:
+            LOGGER.warning(
+                "query_web_search_empty group=%s query=%r error=%s",
+                source_group,
+                query,
+                exc,
+            )
+            if WEB_SEARCH_STOP_TRACK_ON_EMPTY:
+                LOGGER.warning("search_track_aborted group=%s reason=empty_web_search_response", source_group)
+                break
+            continue
+        except (RuntimeError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            LOGGER.warning(
+                "query_web_search_failed group=%s query=%r error=%s",
+                source_group,
+                query,
+                exc,
+            )
+            continue
         for result in response.results:
             url = result.url
             if url in seen:
@@ -409,6 +551,7 @@ def collect_ollama_web_search_results(queries):
             seen.add(url)
             results.append(
                 {
+                    "group": source_group,
                     "query": query,
                     "title": result.title,
                     "url": url,
@@ -416,7 +559,141 @@ def collect_ollama_web_search_results(queries):
                 }
             )
             if len(results) >= WEB_SEARCH_RESULT_LIMIT:
+                LOGGER.info("search_track_complete group=%s results=%s", source_group, len(results))
                 return results
+    if not results:
+        LOGGER.warning("search_track_empty group=%s", source_group)
+        return []
+    LOGGER.info("search_track_complete group=%s results=%s", source_group, len(results))
+    return results
+
+
+def text_from_xml(element, *names):
+    for name in names:
+        found = element.find(name)
+        if found is not None and found.text:
+            return found.text.strip()
+    for child in element:
+        local_name = child.tag.rsplit("}", 1)[-1]
+        if local_name in names and child.text:
+            return child.text.strip()
+    return ""
+
+
+def link_from_feed_item(item):
+    link = text_from_xml(item, "link")
+    if link:
+        return link
+    for child in item:
+        local_name = child.tag.rsplit("}", 1)[-1]
+        if local_name == "link":
+            href = child.attrib.get("href")
+            if href:
+                return href
+    return ""
+
+
+def strip_html_tags(value):
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html.unescape(value or ""))).strip()
+
+
+def parse_feed_entries(feed_text, feed_url):
+    root = ET.fromstring(feed_text)
+    entries = root.findall(".//item")
+    if not entries:
+        entries = [
+            element
+            for element in root.findall(".//*")
+            if element.tag.rsplit("}", 1)[-1] == "entry"
+        ]
+
+    parsed_entries = []
+    for entry in entries:
+        title = strip_html_tags(text_from_xml(entry, "title"))
+        url = link_from_feed_item(entry)
+        summary = strip_html_tags(
+            text_from_xml(entry, "description", "summary", "content", "encoded")
+        )
+        published = text_from_xml(entry, "pubDate", "published", "updated")
+        if not title or not url:
+            continue
+        parsed_entries.append(
+            {
+                "title": title,
+                "url": url,
+                "content": summary,
+                "published": published,
+                "query": feed_url,
+            }
+        )
+    return parsed_entries
+
+
+def fetch_feed_entries(feed_url):
+    LOGGER.info("feed_fetch_start url=%r", feed_url)
+    request = urllib.request.Request(
+        feed_url,
+        headers={"User-Agent": MAILERSEND_USER_AGENT},
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=45) as response:
+        body = response.read().decode("utf-8", errors="replace")
+    LOGGER.info("feed_fetch_response url=%r status=%s bytes=%s", feed_url, response.status, len(body))
+    entries = parse_feed_entries(body, feed_url)
+    LOGGER.info("feed_fetch_complete url=%r entries=%s", feed_url, len(entries))
+    return entries
+
+
+def collect_curated_feed_results(vendors):
+    vendor_terms = [str(vendor).casefold() for vendor in vendors if str(vendor).strip()]
+    seen = set()
+    general_results = []
+    vendor_results = []
+
+    LOGGER.info(
+        "curated_feed_search_start feeds=%s vendor_count=%s",
+        len(CYBERSECURITY_FEED_URLS),
+        len(vendor_terms),
+    )
+    for feed_url in CYBERSECURITY_FEED_URLS:
+        try:
+            entries = fetch_feed_entries(feed_url)
+        except (ET.ParseError, OSError, UnicodeDecodeError, urllib.error.URLError, TimeoutError) as exc:
+            LOGGER.warning("feed_fetch_failed url=%r error=%s", feed_url, exc)
+            continue
+
+        for entry in entries:
+            url = entry["url"]
+            if url in seen:
+                continue
+            seen.add(url)
+            searchable_text = f"{entry['title']} {entry['content']}".casefold()
+            result = {
+                "query": entry["query"],
+                "title": entry["title"],
+                "url": url,
+                "content": " ".join(
+                    part for part in [entry.get("published"), entry["content"]] if part
+                ),
+            }
+            if len(general_results) < GENERAL_SECURITY_MAX_ITEMS:
+                general_results.append({"group": "general", **result})
+            if vendor_terms and any(vendor in searchable_text for vendor in vendor_terms):
+                vendor_results.append({"group": "vendor", **result})
+
+            if (
+                len(general_results) >= GENERAL_SECURITY_MAX_ITEMS
+                and len(vendor_results) >= WEB_SEARCH_RESULT_LIMIT
+            ):
+                break
+
+    results = general_results + vendor_results
+    LOGGER.info(
+        "curated_feed_search_complete general_results=%s vendor_results=%s total_results=%s",
+        len(general_results),
+        len(vendor_results),
+        len(results),
+    )
     return results
 
 
@@ -430,6 +707,7 @@ def summarize_search_results(results):
             "\n".join(
                 [
                     f"{index}. {result['title']}",
+                    f"Result group: {result.get('group', 'general')}",
                     f"Search query: {result['query']}",
                     f"URL: {result['url']}",
                     f"Snippet: {result['content']}",
@@ -455,6 +733,11 @@ def summarize_search_results(results):
                 "role": "user",
                 "content": (
                     f"Today is {today}. Yesterday was {yesterday}. Create a daily briefing about {DIGEST_TOPIC}.\n\n"
+                    "The search results are already separated into two groups: `general` for broad cybersecurity "
+                    "news and `vendor` for findings based on the local app vendor data. Preserve both jobs in "
+                    "one combined email: use general results for section 1 and vendor results for section 2. "
+                    "If one group has no useful results, say that plainly in that section and still produce the "
+                    "other section.\n\n"
                     f"{chr(10).join(lines)}\n\n"
                     f"{digest_format_instructions(bool(app_vendors))}"
                 ),
@@ -464,22 +747,47 @@ def summarize_search_results(results):
 
 
 def run_ollama_query_planner_search():
-    queries = generate_search_queries()
-    results = collect_ollama_web_search_results(queries)
-    LOGGER.info("query_planner_results_count count=%s", len(results))
+    app_vendors, _ = get_app_vendor_context()
+    LOGGER.info(
+        "two_track_search_start topic=%r general_max_items=%s vendor_count=%s",
+        DIGEST_TOPIC,
+        GENERAL_SECURITY_MAX_ITEMS,
+        len(app_vendors),
+    )
+    general_queries = generate_general_search_queries()
+    general_results = collect_ollama_web_search_results(general_queries, "general")
+
+    vendor_results = []
+    if app_vendors:
+        vendor_queries = generate_vendor_search_queries(app_vendors)
+        vendor_results = collect_ollama_web_search_results(vendor_queries, "vendor")
+    else:
+        LOGGER.info("vendor_search_skipped reason=no_app_vendors")
+
+    results = general_results + vendor_results
+    LOGGER.info(
+        "two_track_search_complete general_results=%s vendor_results=%s total_results=%s",
+        len(general_results),
+        len(vendor_results),
+        len(results),
+    )
+    if not results:
+        LOGGER.warning("two_track_web_search_empty action=curated_feed_fallback")
+        results = collect_curated_feed_results(app_vendors)
+    if not results:
+        raise RuntimeError("No web search results were collected from Ollama web search or curated feeds.")
     return summarize_search_results(results)
 
 
 def fallback_digest(ollama_error):
-    LOGGER.exception("digest_failed error=%s", ollama_error)
+    LOGGER.error("digest_failed error=%s", ollama_error)
     today = datetime.now().strftime("%B %d, %Y")
     lines = [
         f"Daily Cybersecurity News Digest - {today}",
         "",
-        f"Ollama web-search digest was unavailable: {ollama_error}",
+        f"Cybersecurity digest source collection was unavailable: {ollama_error}",
         "",
-        "No fallback feeds are configured. This script now relies on LLM-directed Ollama web_search.",
-        "Check that Ollama is running locally, the model is available, and OLLAMA_API_KEY is set for web search.",
+        "Check the terminal logs for Ollama web_search empty responses, curated feed fetch failures, or local model timeout errors.",
     ]
     return "\n".join(lines)
 
@@ -518,6 +826,46 @@ def markdown_to_email_html(markdown):
     code_lines = []
     paragraph_lines = []
 
+    def split_table_row(line):
+        cells = line.strip().strip("|").split("|")
+        return [cell.strip() for cell in cells]
+
+    def is_table_separator(line):
+        cells = split_table_row(line)
+        if not cells:
+            return False
+        return all(re.fullmatch(r":?-{3,}:?", cell.strip()) for cell in cells)
+
+    def is_table_start(lines, index):
+        if index + 1 >= len(lines):
+            return False
+        return "|" in lines[index] and is_table_separator(lines[index + 1])
+
+    def render_table(headers, rows):
+        header_html = "".join(
+            '<th style="padding:11px 12px;background:#e8f0f8;color:#0f172a;'
+            'font-size:13px;line-height:1.35;text-align:left;border:1px solid #cbd5e1;'
+            'font-weight:800">'
+            f"{render_inline_markdown(header)}</th>"
+            for header in headers
+        )
+        row_html = []
+        for row in rows:
+            padded_row = row[: len(headers)] + [""] * max(0, len(headers) - len(row))
+            cells = "".join(
+                '<td style="padding:10px 12px;color:#334155;font-size:14px;'
+                'line-height:1.45;border:1px solid #dbe5ef;vertical-align:top">'
+                f"{render_inline_markdown(cell)}</td>"
+                for cell in padded_row
+            )
+            row_html.append(f"<tr>{cells}</tr>")
+        return (
+            '<table style="width:100%;margin:0 0 18px;border-collapse:collapse;'
+            'background:#ffffff;border:1px solid #cbd5e1">'
+            f"<thead><tr>{header_html}</tr></thead>"
+            f"<tbody>{''.join(row_html)}</tbody></table>"
+        )
+
     def close_paragraph():
         if not paragraph_lines:
             return
@@ -533,7 +881,10 @@ def markdown_to_email_html(markdown):
             tag = list_stack.pop()
             blocks.append(f"</{tag}>")
 
-    for raw_line in markdown.splitlines():
+    lines = markdown.splitlines()
+    index = 0
+    while index < len(lines):
+        raw_line = lines[index]
         line = raw_line.rstrip()
         stripped = line.strip()
 
@@ -551,15 +902,33 @@ def markdown_to_email_html(markdown):
                 in_code_block = False
             else:
                 in_code_block = True
+            index += 1
             continue
 
         if in_code_block:
             code_lines.append(line)
+            index += 1
             continue
 
         if not stripped:
             close_paragraph()
             close_lists()
+            index += 1
+            continue
+
+        if is_table_start(lines, index):
+            close_paragraph()
+            close_lists()
+            headers = split_table_row(lines[index])
+            index += 2
+            rows = []
+            while index < len(lines):
+                row_line = lines[index].strip()
+                if not row_line or "|" not in row_line:
+                    break
+                rows.append(split_table_row(row_line))
+                index += 1
+            blocks.append(render_table(headers, rows))
             continue
 
         heading = re.match(r"^(#{1,3})\s+(.+)$", stripped)
@@ -588,6 +957,7 @@ def markdown_to_email_html(markdown):
                     'font-weight:800;color:#1e293b">'
                     f"{heading_text}</h3>"
                 )
+            index += 1
             continue
 
         list_item = re.match(r"^(\s*)([-*]|\d+[.])\s+(.+)$", line)
@@ -620,10 +990,12 @@ def markdown_to_email_html(markdown):
                 f'<li style="{item_style}">'
                 f"{render_inline_markdown(list_item.group(3).strip())}</li>"
             )
+            index += 1
             continue
 
         close_lists()
         paragraph_lines.append(line)
+        index += 1
 
     close_paragraph()
     close_lists()
@@ -787,7 +1159,7 @@ def send_email(body, subject=None):
 
 def generate_digest():
     try:
-        return run_ollama_web_search_agent()
+        return run_ollama_query_planner_search()
     except (
         RuntimeError,
         ollama.RequestError,
@@ -797,10 +1169,12 @@ def generate_digest():
         ValueError,
         urllib.error.URLError,
         TimeoutError,
-    ) as tool_exc:
-        LOGGER.warning("tool_agent_failed error=%s", tool_exc)
+    ) as search_exc:
+        LOGGER.warning("two_track_search_failed error=%s", search_exc)
+        if not ENABLE_TOOL_AGENT_FALLBACK:
+            return fallback_digest(f"two-track web search failed: {search_exc}")
         try:
-            return run_ollama_query_planner_search()
+            return run_ollama_web_search_agent()
         except (
             RuntimeError,
             ollama.RequestError,
@@ -810,8 +1184,8 @@ def generate_digest():
             ValueError,
             urllib.error.URLError,
             TimeoutError,
-        ) as search_exc:
-            return fallback_digest(f"tool calling failed: {tool_exc}; LLM-directed web search failed: {search_exc}")
+        ) as tool_exc:
+            return fallback_digest(f"two-track web search failed: {search_exc}; tool calling failed: {tool_exc}")
 
 
 def run_once(dry_run=False):
