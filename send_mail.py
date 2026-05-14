@@ -57,9 +57,10 @@ MAILERSEND_TO = os.getenv("MAILERSEND_TO", SMTP_TO)
 MAILERSEND_USER_AGENT = os.getenv("MAILERSEND_USER_AGENT", "openfang-news/1.0")
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "nemotron3:33b")
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
-OLLAMA_CHAT_TIMEOUT_SECONDS = float(os.getenv("OLLAMA_CHAT_TIMEOUT_SECONDS", "180"))
+_ollama_timeout_raw = os.getenv("OLLAMA_CHAT_TIMEOUT_SECONDS", "none")
+OLLAMA_CHAT_TIMEOUT_SECONDS = None if _ollama_timeout_raw.lower() == "none" else float(_ollama_timeout_raw)
 
 DEFAULT_APP_VENDOR_DATA_DIR = Path(__file__).resolve().parent / "data"
 DEFAULT_APP_VENDOR_CACHE_PATH = DEFAULT_APP_VENDOR_DATA_DIR / ".cache" / "app_vendors.json"
@@ -67,21 +68,21 @@ DIGEST_TOPIC = os.getenv("DIGEST_TOPIC", "latest cybersecurity news")
 DIGEST_MAX_ITEMS = int(os.getenv("DIGEST_MAX_ITEMS", "12"))
 GENERAL_SECURITY_MAX_ITEMS = int(os.getenv("GENERAL_SECURITY_MAX_ITEMS", "15"))
 DIGEST_TIME = os.getenv("DIGEST_TIME", "08:00")
-OLLAMA_TOOL_ITERATIONS = int(os.getenv("OLLAMA_TOOL_ITERATIONS", "6"))
+OLLAMA_TOOL_ITERATIONS = int(os.getenv("OLLAMA_TOOL_ITERATIONS", "3"))
 ENABLE_TOOL_AGENT_FALLBACK = os.getenv("ENABLE_TOOL_AGENT_FALLBACK", "0").lower() in {"1", "true", "yes"}
 APP_VENDOR_DATA_DIR = os.getenv("APP_VENDOR_DATA_DIR", str(DEFAULT_APP_VENDOR_DATA_DIR))
 APP_VENDOR_COLUMN = os.getenv("APP_VENDOR_COLUMN", "app_vendor")
-APP_VENDOR_LIMIT = int(os.getenv("APP_VENDOR_LIMIT", "50"))
+APP_VENDOR_LIMIT = int(os.getenv("APP_VENDOR_LIMIT", "15"))
 APP_VENDOR_CACHE_PATH = os.getenv("APP_VENDOR_CACHE_PATH", str(DEFAULT_APP_VENDOR_CACHE_PATH))
 WEB_SEARCH_RESULT_LIMIT = int(
     os.getenv(
         "WEB_SEARCH_RESULT_LIMIT",
-        str(max(DIGEST_MAX_ITEMS, GENERAL_SECURITY_MAX_ITEMS + min(APP_VENDOR_LIMIT, 50))),
+        15,
     )
 )
-WEB_SEARCH_RETRIES = int(os.getenv("WEB_SEARCH_RETRIES", "2"))
-WEB_SEARCH_RETRY_DELAY_SECONDS = float(os.getenv("WEB_SEARCH_RETRY_DELAY_SECONDS", "2"))
-WEB_SEARCH_REQUEST_DELAY_SECONDS = float(os.getenv("WEB_SEARCH_REQUEST_DELAY_SECONDS", "8"))
+WEB_SEARCH_RETRIES = int(os.getenv("WEB_SEARCH_RETRIES", "1"))
+WEB_SEARCH_RETRY_DELAY_SECONDS = float(os.getenv("WEB_SEARCH_RETRY_DELAY_SECONDS", "45"))
+WEB_SEARCH_REQUEST_DELAY_SECONDS = float(os.getenv("WEB_SEARCH_REQUEST_DELAY_SECONDS", "25"))
 WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "1").lower() in {"1", "true", "yes"}
 WEB_SEARCH_STOP_TRACK_ON_EMPTY = os.getenv("WEB_SEARCH_STOP_TRACK_ON_EMPTY", "1").lower() in {"1", "true", "yes"}
 WEB_SEARCH_STOP_TRACK_ON_RATE_LIMIT = os.getenv("WEB_SEARCH_STOP_TRACK_ON_RATE_LIMIT", "1").lower() in {"1", "true", "yes"}
@@ -170,7 +171,7 @@ def ollama_chat(messages):
         model=OLLAMA_MODEL,
         messages=messages,
         stream=False,
-        options={"temperature": 0.2},
+        options={"temperature": 0.2, "num_ctx": 32768},
     )
     content = response["message"]["content"].strip()
     LOGGER.info(
@@ -784,7 +785,7 @@ def summarize_search_results(results):
                     f"Result group: {result.get('group', 'general')}",
                     f"Search query: {result['query']}",
                     f"URL: {result['url']}",
-                    f"Snippet: {result['content']}",
+                    f"Snippet: {result['content'][:500]}",
                 ]
             )
         )
