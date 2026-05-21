@@ -83,8 +83,8 @@ OLLAMA_CHAT_TIMEOUT_SECONDS = (
 DEFAULT_APP_VENDOR_DATA_DIR = Path(__file__).resolve().parent / "data"
 DEFAULT_APP_VENDOR_CACHE_PATH = DEFAULT_APP_VENDOR_DATA_DIR / ".cache" / "app_vendors.json"
 DIGEST_TOPIC = os.getenv("DIGEST_TOPIC", "latest cybersecurity news")
-DIGEST_MAX_ITEMS = int(os.getenv("DIGEST_MAX_ITEMS", "12"))
-GENERAL_SECURITY_MAX_ITEMS = int(os.getenv("GENERAL_SECURITY_MAX_ITEMS", "15"))
+DIGEST_MAX_ITEMS = int(os.getenv("DIGEST_MAX_ITEMS", "2"))
+GENERAL_SECURITY_MAX_ITEMS = int(os.getenv("GENERAL_SECURITY_MAX_ITEMS", "2"))
 DIGEST_TIME = os.getenv("DIGEST_TIME", "08:00")
 OLLAMA_TOOL_ITERATIONS = int(os.getenv("OLLAMA_TOOL_ITERATIONS", "3"))
 ENABLE_TOOL_AGENT_FALLBACK = os.getenv("ENABLE_TOOL_AGENT_FALLBACK", "0").lower() in {
@@ -94,9 +94,9 @@ ENABLE_TOOL_AGENT_FALLBACK = os.getenv("ENABLE_TOOL_AGENT_FALLBACK", "0").lower(
 }
 APP_VENDOR_DATA_DIR = os.getenv("APP_VENDOR_DATA_DIR", str(DEFAULT_APP_VENDOR_DATA_DIR))
 APP_VENDOR_COLUMN = os.getenv("APP_VENDOR_COLUMN", "app_vendor")
-APP_VENDOR_LIMIT = int(os.getenv("APP_VENDOR_LIMIT", "15"))
+APP_VENDOR_LIMIT = int(os.getenv("APP_VENDOR_LIMIT", "2"))
 APP_VENDOR_CACHE_PATH = os.getenv("APP_VENDOR_CACHE_PATH", str(DEFAULT_APP_VENDOR_CACHE_PATH))
-WEB_SEARCH_RESULT_LIMIT = int(os.getenv("WEB_SEARCH_RESULT_LIMIT", 15))
+WEB_SEARCH_RESULT_LIMIT = int(os.getenv("WEB_SEARCH_RESULT_LIMIT", 2))
 WEB_SEARCH_RETRIES = int(os.getenv("WEB_SEARCH_RETRIES", "1"))
 WEB_SEARCH_RETRY_DELAY_SECONDS = float(os.getenv("WEB_SEARCH_RETRY_DELAY_SECONDS", "45"))
 WEB_SEARCH_REQUEST_DELAY_SECONDS = float(os.getenv("WEB_SEARCH_REQUEST_DELAY_SECONDS", "25"))
@@ -745,142 +745,394 @@ def analyse_vendor_results(vendor_results: list[dict]) -> list[VendorItem]:
 # Markdown rendering from structured objects
 # ---------------------------------------------------------------------------
 
+# Executive briefing palette — restrained, near-monochrome with one
+# severity-dot accent. Designed for senior-leadership readers (CEO/CIO).
+_SEVERITY_PALETTE = {
+    "CRITICAL": {"dot": "#b91c1c", "label": "Critical", "rank": 0},
+    "HIGH":     {"dot": "#c2410c", "label": "High",     "rank": 1},
+    "MEDIUM":   {"dot": "#a16207", "label": "Medium",   "rank": 2},
+    "LOW":      {"dot": "#15803d", "label": "Low",      "rank": 3},
+    "INFO":     {"dot": "#1d4ed8", "label": "Info",     "rank": 4},
+}
+
+_DEFAULT_PALETTE = {"dot": "#94a3b8", "label": "Unknown", "rank": 5}
+
+# Shared neutral tokens
+_C_INK = "#0b1424"           # masthead navy / strongest text
+_C_TEXT = "#0f172a"          # primary body text
+_C_MUTED = "#475569"         # secondary text
+_C_FAINT = "#94a3b8"         # tertiary / placeholder
+_C_RULE = "#e3e7ec"          # hairline borders
+_C_CHIP_BG = "#f5f6f8"       # neutral chip / strip background
+_C_PANEL = "#fafbfc"         # subtle panel background
+_C_LINK = "#1d4ed8"          # muted royal blue
+
+
+def _severity_palette(severity: str) -> dict:
+    return _SEVERITY_PALETTE.get((severity or "").strip().upper(), _DEFAULT_PALETTE)
+
+
 def _severity_badge(severity: str) -> str:
-    """Return a short inline severity label (used in markdown)."""
-    sev = severity.strip().upper()
-    labels = {
-        "CRITICAL": "🔴 Critical",
-        "HIGH": "🟠 High",
-        "MEDIUM": "🟡 Medium",
-        "LOW": "🟢 Low",
-        "INFO": "ℹ️ Info",
-    }
-    return labels.get(sev, severity)
+    """Refined severity indicator — color dot + uppercase label on a neutral chip."""
+    pal = _severity_palette(severity)
+    return (
+        '<span style="display:inline-block;padding:3px 9px;border-radius:3px;'
+        f'background:{_C_CHIP_BG};border:1px solid {_C_RULE};color:{_C_TEXT};'
+        'font-size:10px;line-height:1.5;font-weight:700;text-transform:uppercase;'
+        'letter-spacing:0.10em;white-space:nowrap">'
+        f'<span style="display:inline-block;width:7px;height:7px;border-radius:50%;'
+        f'background:{pal["dot"]};margin-right:6px;vertical-align:middle"></span>'
+        f'<span style="vertical-align:middle">{html.escape(pal["label"])}</span></span>'
+    )
+
+
+def _pill(text: str, *, accent: str | None = None) -> str:
+    """Minimal neutral chip — uppercase, hairline border, optional accent text color."""
+    color = accent or _C_TEXT
+    return (
+        '<span style="display:inline-block;padding:3px 9px;border-radius:3px;'
+        f'background:{_C_CHIP_BG};border:1px solid {_C_RULE};'
+        f'color:{color};font-size:10px;line-height:1.5;font-weight:700;'
+        'text-transform:uppercase;letter-spacing:0.10em;white-space:nowrap">'
+        f'{html.escape(text)}</span>'
+    )
+
+
+def _safe(text) -> str:
+    return html.escape((text or "").strip())
+
+
+def _is_stated(value) -> bool:
+    return bool(value) and value.strip() and value.strip().lower() != "not stated"
+
+
+def _section_eyebrow(text: str) -> str:
+    """Small uppercase eyebrow label, used inside cards."""
+    return (
+        '<div style="font-size:10px;letter-spacing:0.14em;text-transform:uppercase;'
+        f'color:{_C_MUTED};font-weight:700;margin:0 0 6px">{html.escape(text)}</div>'
+    )
+
+
+def _exploited_in_wild(item: GeneralItem) -> bool:
+    return any("EXPLOITED" in (c.exploitation_status or "").upper() for c in item.cves)
+
+
+def _render_metrics_strip(
+    general_items: list[GeneralItem],
+    vendor_items: list[VendorItem],
+) -> str:
+    """Four-cell metrics strip shown at the top of the briefing."""
+    crit = sum(1 for i in general_items if (i.severity or "").strip().upper() == "CRITICAL")
+    high = sum(1 for i in general_items if (i.severity or "").strip().upper() == "HIGH")
+    exploited = sum(1 for i in general_items if _exploited_in_wild(i))
+    vendors_affected = sum(1 for v in vendor_items if v.findings)
+
+    def cell(value: int, label: str, accent: str, last: bool = False) -> str:
+        right = "" if last else f"border-right:1px solid {_C_RULE};"
+        return (
+            f'<td style="padding:18px 8px;text-align:center;{right}background:{_C_PANEL};width:25%">'
+            f'<div style="font-size:28px;font-weight:800;color:{accent};line-height:1;'
+            'font-family:\'SF Mono\',Menlo,Consolas,monospace">'
+            f'{value}</div>'
+            f'<div style="margin-top:8px;font-size:10px;letter-spacing:0.14em;'
+            f'text-transform:uppercase;color:{_C_MUTED};font-weight:700">{html.escape(label)}</div>'
+            '</td>'
+        )
+
+    return (
+        "<!--HTML-->\n"
+        f'<table role="presentation" style="width:100%;border-collapse:collapse;'
+        f'margin:0 0 28px;border:1px solid {_C_RULE};background:{_C_PANEL}">'
+        "<tr>"
+        + cell(crit, "Critical", _SEVERITY_PALETTE["CRITICAL"]["dot"] if crit else _C_TEXT)
+        + cell(high, "High", _SEVERITY_PALETTE["HIGH"]["dot"] if high else _C_TEXT)
+        + cell(exploited, "Active Exploits", _SEVERITY_PALETTE["CRITICAL"]["dot"] if exploited else _C_TEXT)
+        + cell(vendors_affected, "Vendors Affected", _C_TEXT, last=True)
+        + "</tr></table>\n"
+        "<!--/HTML-->"
+    )
+
+
+def _render_general_item_card(item: GeneralItem) -> str:
+    title = item.title or item.raw_title or "Untitled"
+    org = item.organization if _is_stated(item.organization) else ""
+
+    # Header — rank as a discreet monospace marker, badges on the right.
+    rank_html = (
+        f'<span style="font-family:\'SF Mono\',Menlo,Consolas,monospace;'
+        f'font-size:11px;color:{_C_FAINT};font-weight:700;letter-spacing:0.04em">'
+        f'No. {item.rank:02d}</span>'
+    )
+    org_html = (
+        f'<span style="margin-left:14px;color:{_C_INK};font-size:12px;font-weight:800;'
+        'text-transform:uppercase;letter-spacing:0.08em">'
+        f'{_safe(org)}</span>'
+        if org else ""
+    )
+    badges = []
+    if _is_stated(item.severity):
+        badges.append(_severity_badge(item.severity))
+    if _is_stated(item.patch_priority):
+        badges.append(_pill(f"Patch · {item.patch_priority}"))
+    if _exploited_in_wild(item):
+        badges.append(_pill("Active Exploit", accent=_SEVERITY_PALETTE["CRITICAL"]["dot"]))
+    badges_html = (
+        f'<span style="float:right">{" ".join(badges)}</span>' if badges else ""
+    )
+
+    header_html = (
+        f'<div style="margin:0 0 10px;padding:0 0 10px;border-bottom:1px solid {_C_RULE};'
+        'line-height:1.6">'
+        f'{rank_html}{org_html}{badges_html}'
+        '<div style="clear:both"></div>'
+        '</div>'
+    )
+
+    title_html = (
+        f'<div style="margin:0 0 10px;font-size:17px;line-height:1.35;'
+        f'font-weight:800;color:{_C_TEXT};letter-spacing:-0.005em">'
+        f'{_safe(title)}</div>'
+    )
+
+    why_html = (
+        f'<p style="margin:0 0 16px;color:{_C_MUTED};font-size:14px;line-height:1.65">'
+        f'{_safe(item.why_it_matters)}</p>'
+        if item.why_it_matters else ""
+    )
+
+    cve_table_html = ""
+    if item.cves:
+        rows = []
+        for cve in item.cves:
+            sev_badge = _severity_badge(cve.severity) if _is_stated(cve.severity) else (
+                f'<span style="color:{_C_FAINT};font-size:12px">—</span>'
+            )
+            product_cell = _safe(cve.affected_product) or "—"
+            if _is_stated(cve.affected_versions):
+                product_cell += (
+                    f'<div style="color:{_C_FAINT};font-size:11px;margin-top:2px">'
+                    f'{_safe(cve.affected_versions)}</div>'
+                )
+            rows.append(
+                "<tr>"
+                f'<td style="padding:10px 12px;border-bottom:1px solid {_C_RULE};'
+                f'color:{_C_TEXT};font-weight:700;font-family:\'SF Mono\',Menlo,Consolas,monospace;'
+                f'font-size:12px;white-space:nowrap;vertical-align:top">{_safe(cve.cve_id) or "—"}</td>'
+                f'<td style="padding:10px 12px;border-bottom:1px solid {_C_RULE};'
+                f'color:{_C_TEXT};font-size:13px;vertical-align:top">{product_cell}</td>'
+                f'<td style="padding:10px 12px;border-bottom:1px solid {_C_RULE};'
+                f'color:{_C_TEXT};font-size:13px;text-align:center;font-weight:700;'
+                f'font-family:\'SF Mono\',Menlo,Consolas,monospace;vertical-align:top">'
+                f'{_safe(cve.cvss_score) or "—"}</td>'
+                f'<td style="padding:10px 12px;border-bottom:1px solid {_C_RULE};'
+                f'vertical-align:top">{sev_badge}</td>'
+                f'<td style="padding:10px 12px;border-bottom:1px solid {_C_RULE};'
+                f'color:{_C_MUTED};font-size:13px;vertical-align:top">{_safe(cve.exploitation_status) or "—"}</td>'
+                f'<td style="padding:10px 12px;border-bottom:1px solid {_C_RULE};'
+                f'color:{_C_TEXT};font-size:12px;font-family:\'SF Mono\',Menlo,Consolas,monospace;'
+                f'vertical-align:top">{_safe(cve.fixed_version) or "—"}</td>'
+                "</tr>"
+            )
+        # Strip the bottom border on the last row for a clean edge.
+        if rows:
+            rows[-1] = rows[-1].replace(
+                f"border-bottom:1px solid {_C_RULE};", "border-bottom:0;",
+            )
+        th_style = (
+            f'padding:8px 12px;background:{_C_PANEL};color:{_C_MUTED};font-size:10px;'
+            'text-align:left;text-transform:uppercase;letter-spacing:0.12em;font-weight:700;'
+            f'border-bottom:1px solid {_C_RULE}'
+        )
+        cve_table_html = (
+            f'<div style="margin:0 0 16px;border:1px solid {_C_RULE};background:#ffffff">'
+            '<table style="width:100%;border-collapse:collapse">'
+            '<thead><tr>'
+            f'<th style="{th_style}">CVE</th>'
+            f'<th style="{th_style}">Product</th>'
+            f'<th style="{th_style};text-align:center">CVSS</th>'
+            f'<th style="{th_style}">Severity</th>'
+            f'<th style="{th_style}">Exploitation</th>'
+            f'<th style="{th_style}">Fixed in</th>'
+            '</tr></thead>'
+            f'<tbody>{"".join(rows)}</tbody></table></div>'
+        )
+
+    action_html = ""
+    if item.defender_action:
+        action_html = (
+            f'<div style="margin:0 0 14px;padding:12px 14px;background:{_C_PANEL};'
+            f'border-left:2px solid {_C_INK};color:{_C_TEXT};font-size:14px;line-height:1.6">'
+            '<span style="font-weight:800;color:#1e293b;text-transform:uppercase;'
+            'font-size:10px;letter-spacing:0.12em;display:block;margin-bottom:4px">'
+            'Recommended Action</span>'
+            f'{_safe(item.defender_action)}</div>'
+        )
+
+    link_html = ""
+    if item.source_url:
+        link_html = (
+            '<div style="margin:0;text-align:right">'
+            f'<a href="{html.escape(item.source_url, quote=True)}" '
+            f'style="color:{_C_LINK};text-decoration:none;font-weight:700;font-size:12px;'
+            'text-transform:uppercase;letter-spacing:0.10em">'
+            'Read source &rarr;</a></div>'
+        )
+
+    return (
+        '<div style="margin:0 0 18px;background:#ffffff;'
+        f'border:1px solid {_C_RULE};padding:20px 22px">'
+        f'{header_html}{title_html}{why_html}{cve_table_html}{action_html}{link_html}'
+        '</div>'
+    )
 
 
 def render_general_items_markdown(items: list[GeneralItem]) -> str:
-    """
-    Render each general security item as a self-contained markdown card.
-
-    Why `### #N` headings instead of `N.` markdown list items:
-    each item has multi-line continuation content (severity, why_it_matters,
-    CVEs, action, source link). The continuation lines do not match the `<ol>`
-    list-item pattern, so the markdown→HTML converter closes the list after
-    the first line and opens a fresh `<ol>` for the next item — which
-    auto-numbers from 1 every time. Using a heading puts the rank in the
-    heading text, sidestepping `<ol>` auto-numbering entirely.
-    """
+    """Render the general security section as executive-style HTML cards."""
     if not items:
         return "_No general security stories were found today._\n"
+    cards = "".join(_render_general_item_card(i) for i in items)
+    return f"<!--HTML-->\n{cards}\n<!--/HTML-->"
 
-    blocks: list[str] = []
-    for item in items:
-        title_text = item.title or item.raw_title or "Untitled"
-        org = item.organization if item.organization and item.organization != "Not stated" else ""
-        if org:
-            heading = f"### #{item.rank} · {org} — {title_text}"
-        else:
-            heading = f"### #{item.rank} · {title_text}"
 
-        lines: list[str] = [heading, ""]
+def _render_vendor_item_card(item: VendorItem) -> str:
+    finding_count = len(item.findings)
+    count_pill = (
+        _pill(f"{finding_count} finding" + ("" if finding_count == 1 else "s"))
+        if finding_count
+        else _pill("Watch only", accent=_C_MUTED)
+    )
 
-        meta_parts: list[str] = []
-        if item.severity and item.severity != "Not stated":
-            meta_parts.append(_severity_badge(item.severity))
-        if item.patch_priority and item.patch_priority != "Not stated":
-            meta_parts.append(f"Patch priority: **{item.patch_priority}**")
-        if meta_parts:
-            lines.append(" · ".join(meta_parts))
-            lines.append("")
+    # Pick worst severity to surface as a top-level chip on the vendor card.
+    worst_rank = _DEFAULT_PALETTE["rank"]
+    worst_sev: str | None = None
+    for f in item.findings:
+        pal = _severity_palette(f.severity)
+        if pal["rank"] < worst_rank:
+            worst_rank = pal["rank"]
+            worst_sev = f.severity
+    worst_badge = _severity_badge(worst_sev) if worst_sev and _is_stated(worst_sev) else ""
 
-        if item.why_it_matters:
-            lines.append(item.why_it_matters)
-            lines.append("")
+    header_html = (
+        f'<div style="margin:0 0 10px;padding:0 0 10px;border-bottom:1px solid {_C_RULE};'
+        'line-height:1.6">'
+        '<span style="font-size:11px;letter-spacing:0.14em;text-transform:uppercase;'
+        f'color:{_C_MUTED};font-weight:700">Vendor</span>'
+        f'<div style="margin:2px 0 0;font-size:18px;font-weight:800;color:{_C_TEXT};'
+        'letter-spacing:-0.005em;display:inline-block">'
+        f'{_safe(item.vendor_name)}</div>'
+        f'<span style="float:right">{worst_badge} {count_pill}</span>'
+        '<div style="clear:both"></div>'
+        '</div>'
+    )
 
-        if item.cves:
-            if len(item.cves) == 1:
-                cve = item.cves[0]
-                cve_parts: list[str] = []
-                if cve.affected_product and cve.affected_product != "Not stated":
-                    cve_parts.append(f"Product: **{cve.affected_product}**")
-                if cve.cve_id and cve.cve_id != "Not stated":
-                    cve_parts.append(f"CVE: `{cve.cve_id}`")
-                if cve.cvss_score and cve.cvss_score != "Not stated":
-                    cve_parts.append(f"CVSS: {cve.cvss_score}")
-                if cve.vuln_class and cve.vuln_class != "Not stated":
-                    cve_parts.append(f"Class: {cve.vuln_class}")
-                if cve.exploitation_status and cve.exploitation_status != "Not stated":
-                    cve_parts.append(f"Exploitation: {cve.exploitation_status}")
-                if cve.fixed_version and cve.fixed_version != "Not stated":
-                    cve_parts.append(f"Fixed in: `{cve.fixed_version}`")
-                if cve_parts:
-                    lines.append(" | ".join(cve_parts))
-                    lines.append("")
-            else:
-                lines.append(
-                    "| Product | CVE ID | CVSS | Severity | Class | Exploitation | Fixed In |"
+    summary_html = (
+        f'<p style="margin:0 0 14px;color:{_C_MUTED};font-size:14px;line-height:1.65">'
+        f'{_safe(item.summary)}</p>'
+        if item.summary else ""
+    )
+
+    findings_html = ""
+    if item.findings:
+        rows = []
+        for f in item.findings:
+            sev_badge = _severity_badge(f.severity) if _is_stated(f.severity) else (
+                f'<span style="color:{_C_FAINT};font-size:12px">—</span>'
+            )
+            product_cell = _safe(f.affected_product) or "—"
+            if _is_stated(f.affected_versions):
+                product_cell += (
+                    f'<div style="color:{_C_FAINT};font-size:11px;margin-top:2px">'
+                    f'{_safe(f.affected_versions)}</div>'
                 )
-                lines.append(
-                    "|---|---|---|---|---|---|---|"
+            action_cell = _safe(f.defender_action) or "—"
+            source_link = ""
+            if f.source_url:
+                source_link = (
+                    f'<a href="{html.escape(f.source_url, quote=True)}" '
+                    f'style="color:{_C_LINK};text-decoration:none;font-weight:700;'
+                    'font-size:11px;text-transform:uppercase;letter-spacing:0.10em">'
+                    "Source &rarr;</a>"
                 )
-                for cve in item.cves:
-                    lines.append(
-                        f"| {cve.affected_product} | `{cve.cve_id}` | "
-                        f"{cve.cvss_score} | {cve.severity} | {cve.vuln_class} | "
-                        f"{cve.exploitation_status} | `{cve.fixed_version}` |"
-                    )
-                lines.append("")
+            rows.append(
+                "<tr>"
+                f'<td style="padding:10px 12px;border-bottom:1px solid {_C_RULE};'
+                f'color:{_C_TEXT};font-size:13px;vertical-align:top">{product_cell}</td>'
+                f'<td style="padding:10px 12px;border-bottom:1px solid {_C_RULE};'
+                f'color:{_C_TEXT};font-family:\'SF Mono\',Menlo,Consolas,monospace;font-size:12px;'
+                f'white-space:nowrap;vertical-align:top">{_safe(f.cve_id) or "—"}</td>'
+                f'<td style="padding:10px 12px;border-bottom:1px solid {_C_RULE};'
+                f'color:{_C_TEXT};font-size:13px;text-align:center;font-weight:700;'
+                f'font-family:\'SF Mono\',Menlo,Consolas,monospace;vertical-align:top">'
+                f'{_safe(f.cvss_score) or "—"}</td>'
+                f'<td style="padding:10px 12px;border-bottom:1px solid {_C_RULE};'
+                f'vertical-align:top">{sev_badge}</td>'
+                f'<td style="padding:10px 12px;border-bottom:1px solid {_C_RULE};'
+                f'color:{_C_MUTED};font-size:13px;vertical-align:top">{_safe(f.exploitation_status) or "—"}</td>'
+                f'<td style="padding:10px 12px;border-bottom:1px solid {_C_RULE};'
+                f'color:{_C_TEXT};font-size:12px;font-family:\'SF Mono\',Menlo,Consolas,monospace;'
+                f'vertical-align:top">{_safe(f.patched_version) or "—"}</td>'
+                f'<td style="padding:10px 12px;border-bottom:1px solid {_C_RULE};'
+                f'color:{_C_TEXT};font-size:13px;vertical-align:top;line-height:1.5">'
+                f'{action_cell}'
+                + (f'<div style="margin-top:6px">{source_link}</div>' if source_link else "")
+                + "</td>"
+                "</tr>"
+            )
+        if rows:
+            rows[-1] = rows[-1].replace(
+                f"border-bottom:1px solid {_C_RULE};", "border-bottom:0;",
+            )
+        th_style = (
+            f'padding:8px 12px;background:{_C_PANEL};color:{_C_MUTED};font-size:10px;'
+            'text-align:left;text-transform:uppercase;letter-spacing:0.12em;font-weight:700;'
+            f'border-bottom:1px solid {_C_RULE}'
+        )
+        findings_html = (
+            f'<div style="margin:0 0 14px;border:1px solid {_C_RULE};background:#ffffff;'
+            'overflow-x:auto">'
+            '<table style="width:100%;border-collapse:collapse;min-width:720px">'
+            '<thead><tr>'
+            f'<th style="{th_style}">Product</th>'
+            f'<th style="{th_style}">CVE</th>'
+            f'<th style="{th_style};text-align:center">CVSS</th>'
+            f'<th style="{th_style}">Severity</th>'
+            f'<th style="{th_style}">Exploitation</th>'
+            f'<th style="{th_style}">Patched</th>'
+            f'<th style="{th_style}">Recommended Action</th>'
+            '</tr></thead>'
+            f'<tbody>{"".join(rows)}</tbody></table></div>'
+        )
 
-        if item.defender_action:
-            lines.append(f"🛡️ **Action:** {item.defender_action}")
-            lines.append("")
+    sources_html = ""
+    if item.source_urls:
+        links = " &nbsp;·&nbsp; ".join(
+            f'<a href="{html.escape(url, quote=True)}" '
+            f'style="color:{_C_LINK};text-decoration:none;font-weight:700">'
+            f'{i:02d}</a>'
+            for i, url in enumerate(item.source_urls[:5], start=1)
+        )
+        sources_html = (
+            f'<div style="margin:0;color:{_C_MUTED};font-size:11px;line-height:1.5;'
+            'letter-spacing:0.04em">'
+            '<span style="text-transform:uppercase;letter-spacing:0.12em;font-weight:700;'
+            f'color:{_C_MUTED};margin-right:8px;font-size:10px">Sources</span>{links}</div>'
+        )
 
-        if item.source_url:
-            link_label = item.raw_title or item.title or "Read the article"
-            lines.append(f"🔗 [{link_label}]({item.source_url})")
-            lines.append("")
-
-        blocks.append("\n".join(lines))
-
-    return "\n".join(blocks)
+    return (
+        '<div style="margin:0 0 18px;background:#ffffff;'
+        f'border:1px solid {_C_RULE};padding:20px 22px">'
+        f'{header_html}{summary_html}{findings_html}{sources_html}'
+        '</div>'
+    )
 
 
 def render_vendor_items_markdown(items: list[VendorItem]) -> str:
-    """Render the vendor watch section as grouped markdown."""
+    """Render the vendor watch section as executive-style HTML cards."""
     if not items:
         return "_No targeted vendor findings were identified today._\n"
-
-    lines: list[str] = []
-    for item in items:
-        lines.append(f"### {item.vendor_name}")
-        if item.summary:
-            lines.append(item.summary)
-            lines.append("")
-
-        if item.findings:
-            lines.append(
-                "| Product | CVE ID | CVSS | Severity | Class | "
-                "Exploitation | Patched | Defender Action |"
-            )
-            lines.append(
-                "|---------|--------|------|----------|-------|"
-                "--------------|---------|----------------|"
-            )
-            for f in item.findings:
-                lines.append(
-                    f"| {f.affected_product} ({f.affected_versions}) "
-                    f"| `{f.cve_id}` | {f.cvss_score} | {f.severity} "
-                    f"| {f.vuln_class} | {f.exploitation_status} "
-                    f"| {f.patched_version} | {f.defender_action} |"
-                )
-            lines.append("")
-
-        if item.source_urls:
-            refs = " · ".join(f"[source]({url})" for url in item.source_urls[:5])
-            lines.append(f"Sources: {refs}")
-            lines.append("")
-
-    return "\n".join(lines)
+    cards = "".join(_render_vendor_item_card(i) for i in items)
+    return f"<!--HTML-->\n{cards}\n<!--/HTML-->"
 
 
 def render_defensive_actions_markdown(
@@ -1069,33 +1321,34 @@ def render_digest_markdown(
 ) -> str:
     """
     Combine all analysed objects into the final digest markdown that
-    markdown_to_email_html() already knows how to render.
+    markdown_to_email_html() already knows how to render. The masthead
+    (Cybersecurity Intelligence Briefing) is rendered by build_email_html(),
+    so we do not duplicate a top-level h1 here.
     """
-    today, _ = digest_date_window()
     has_vendors = bool(vendor_items)
 
+    metrics_strip = _render_metrics_strip(general_items, vendor_items)
     executive_snapshot = render_executive_snapshot(general_items, vendor_items)
     general_md = render_general_items_markdown(general_items)
     vendor_md = render_vendor_items_markdown(vendor_items) if has_vendors else (
-        "## 2. Targeted Vendor Watch – All Relevant Matches\n"
-        "No targeted vendor list was available.\n"
+        "_No targeted vendor list was available._\n"
     )
     defensive_md = render_defensive_actions_markdown(general_items, vendor_items)
     references_md = render_references_markdown(general_items, vendor_items)
 
     return "\n".join([
-        "# Cybersecurity Briefing",
+        metrics_strip,
         "",
-        "## Executive Snapshot",
+        "## Executive Summary",
         executive_snapshot,
         "",
-        f"## 1. General Company Security – Top {GENERAL_SECURITY_MAX_ITEMS} (Today & Yesterday)",
+        "## General Threat Landscape",
         general_md,
         "",
-        f"## 2. Targeted Vendor Watch – All Relevant Matches",
+        "## Vendor Watch",
         vendor_md,
         "",
-        "## Defensive Actions",
+        "## Recommended Actions",
         defensive_md,
         "",
         "## References",
@@ -1905,23 +2158,12 @@ def render_inline_markdown(text, *, style_severity_badges=True):
 
 def render_severity_badges(markup):
     """Style severity words in visible text without touching HTML tags."""
-    severity_styles = {
-        "Critical": ("#fee2e2", "#991b1b", "#fecaca"),
-        "High": ("#ffedd5", "#9a3412", "#fed7aa"),
-        "Medium": ("#fef9c3", "#854d0e", "#fde68a"),
-        "Low": ("#dcfce7", "#166534", "#bbf7d0"),
-        "Info": ("#dbeafe", "#1e40af", "#bfdbfe"),
-    }
 
     def replace_text_segment(segment):
-        for label, (background, color, border) in severity_styles.items():
+        for label in _SEVERITY_PALETTE_LABELS:
             segment = re.sub(
                 rf"(?<!\w){label}(?!\w)",
-                (
-                    f'<span style="display:inline-block;padding:3px 8px;border-radius:999px;'
-                    f'background:{background};color:{color};border:1px solid {border};'
-                    f'font-size:12px;line-height:1.2;font-weight:800">{label}</span>'
-                ),
+                _severity_badge(label),
                 segment,
             )
         return segment
@@ -1931,6 +2173,9 @@ def render_severity_badges(markup):
         part if part.startswith("<") and part.endswith(">") else replace_text_segment(part)
         for part in parts
     )
+
+
+_SEVERITY_PALETTE_LABELS = [v["label"] for v in _SEVERITY_PALETTE.values()]
 
 
 def markdown_to_email_html(markdown):
@@ -1957,27 +2202,28 @@ def markdown_to_email_html(markdown):
 
     def render_table(headers, rows):
         header_html = "".join(
-            '<th style="padding:12px 14px;background:#eef4ff;color:#0f172a;'
-            'font-size:12px;line-height:1.35;text-align:left;border-bottom:1px solid #d7e3f5;'
-            'font-weight:800;text-transform:uppercase">'
+            f'<th style="padding:8px 12px;background:{_C_PANEL};color:{_C_MUTED};'
+            'font-size:10px;line-height:1.4;text-align:left;'
+            f'border-bottom:1px solid {_C_RULE};'
+            'font-weight:700;text-transform:uppercase;letter-spacing:0.12em">'
             f"{render_inline_markdown(header)}</th>"
             for header in headers
         )
         row_html = []
+        last_index = len(rows) - 1
         for row_index, row in enumerate(rows):
             padded_row = row[: len(headers)] + [""] * max(0, len(headers) - len(row))
-            row_background = "#ffffff" if row_index % 2 == 0 else "#f8fbff"
+            border = "0" if row_index == last_index else f"1px solid {_C_RULE}"
             cells = "".join(
-                f'<td style="padding:12px 14px;color:#334155;font-size:14px;'
-                f'line-height:1.5;border-bottom:1px solid #e6edf7;vertical-align:top;'
-                f'background:{row_background}">'
+                f'<td style="padding:10px 12px;color:{_C_TEXT};font-size:13px;'
+                f'line-height:1.55;border-bottom:{border};vertical-align:top">'
                 f"{render_inline_markdown(cell)}</td>"
                 for cell in padded_row
             )
             row_html.append(f"<tr>{cells}</tr>")
         return (
-            '<div style="margin:0 0 22px;overflow-x:auto;border:1px solid #d7e3f5;'
-            'border-radius:8px;background:#ffffff">'
+            f'<div style="margin:0 0 22px;overflow-x:auto;border:1px solid {_C_RULE};'
+            'background:#ffffff">'
             '<table style="width:100%;border-collapse:collapse;background:#ffffff">'
             f"<thead><tr>{header_html}</tr></thead>"
             f"<tbody>{''.join(row_html)}</tbody></table></div>"
@@ -1988,7 +2234,7 @@ def markdown_to_email_html(markdown):
             return
         text = " ".join(line.strip() for line in paragraph_lines)
         blocks.append(
-            '<p style="margin:0 0 18px;line-height:1.68;color:#334155;font-size:15px">'
+            f'<p style="margin:0 0 16px;line-height:1.7;color:{_C_MUTED};font-size:14px">'
             f"{render_inline_markdown(text)}</p>"
         )
         paragraph_lines.clear()
@@ -2004,6 +2250,22 @@ def markdown_to_email_html(markdown):
         raw_line = lines[index]
         line = raw_line.rstrip()
         stripped = line.strip()
+
+        # Raw HTML pass-through: lines between <!--HTML--> and <!--/HTML--> are
+        # emitted verbatim. Lets the digest renderers produce richly styled
+        # cards instead of relying on markdown→HTML heuristics.
+        if stripped == "<!--HTML-->":
+            close_paragraph()
+            close_lists()
+            index += 1
+            raw_block = []
+            while index < len(lines) and lines[index].strip() != "<!--/HTML-->":
+                raw_block.append(lines[index])
+                index += 1
+            blocks.append("\n".join(raw_block))
+            if index < len(lines):
+                index += 1  # skip the closing marker
+            continue
 
         if stripped.startswith("```"):
             close_paragraph()
@@ -2058,23 +2320,23 @@ def markdown_to_email_html(markdown):
             )
             if level == 1:
                 blocks.append(
-                    '<h1 style="margin:0 0 18px;font-size:24px;line-height:1.25;'
-                    'font-weight:800;color:#0f172a;letter-spacing:0">'
+                    f'<h1 style="margin:0 0 20px;font-size:22px;line-height:1.25;'
+                    f'font-weight:800;color:{_C_INK};letter-spacing:-0.01em">'
                     f"{heading_text}</h1>"
                 )
             elif level == 2:
+                # Executive section header: hairline rule + uppercase eyebrow text.
                 blocks.append(
-                    '<div style="margin:30px 0 16px;padding:14px 16px;'
-                    "background:#f8fafc;border:1px solid #dbe5ef;border-left:4px solid #2563eb;"
-                    'border-radius:8px">'
-                    '<h2 style="margin:0;font-size:18px;line-height:1.3;font-weight:800;color:#0f172a">'
+                    f'<div style="margin:32px 0 16px;padding:0 0 10px;'
+                    f'border-bottom:2px solid {_C_INK}">'
+                    f'<h2 style="margin:0;font-size:12px;line-height:1.3;font-weight:800;'
+                    f'color:{_C_INK};text-transform:uppercase;letter-spacing:0.16em">'
                     f"{heading_text}</h2></div>"
                 )
             else:
                 blocks.append(
-                    '<h3 style="margin:22px 0 10px;font-size:16px;line-height:1.35;'
-                    'font-weight:800;color:#1e293b;border-bottom:1px solid #e2e8f0;'
-                    'padding-bottom:7px">'
+                    f'<h3 style="margin:22px 0 10px;font-size:15px;line-height:1.35;'
+                    f'font-weight:800;color:{_C_TEXT}">'
                     f"{heading_text}</h3>"
                 )
             index += 1
@@ -2086,24 +2348,22 @@ def markdown_to_email_html(markdown):
             indent = len(list_item.group(1).replace("\t", "    "))
             depth = indent // 2
             tag = "ol" if list_item.group(2).endswith(".") else "ul"
-            while len(list_stack) > depth:
+            while len(list_stack) > depth + 1:
                 blocks.append(f"</{list_stack.pop()}>")
-            if len(list_stack) == depth or list_stack[-1] != tag:
-                if len(list_stack) > depth:
-                    blocks.append(f"</{list_stack.pop()}>")
+            if len(list_stack) == depth + 1 and list_stack[-1] != tag:
+                blocks.append(f"</{list_stack.pop()}>")
+            while len(list_stack) <= depth:
                 list_style = (
-                    "margin:0 0 22px;padding:0 0 0 22px;line-height:1.58;color:#334155"
-                    if depth == 0
-                    else "margin:8px 0 14px 20px;padding:0;line-height:1.55;color:#334155"
+                    f"margin:0 0 18px;padding:0 0 0 22px;line-height:1.65;color:{_C_MUTED};font-size:14px"
+                    if len(list_stack) == 0
+                    else f"margin:6px 0 10px 20px;padding:0;line-height:1.6;color:{_C_MUTED};font-size:14px"
                 )
                 blocks.append(f'<{tag} style="{list_style}">')
                 list_stack.append(tag)
             item_style = (
-                "margin:0 0 12px;padding:14px 16px;background:#ffffff;"
-                "border:1px solid #e2e8f0;border-left:4px solid #38bdf8;"
-                "border-radius:8px;color:#334155"
+                f"margin:0 0 8px;padding-left:4px;color:{_C_MUTED};line-height:1.65"
                 if depth == 0
-                else "margin:0 0 8px;color:#334155"
+                else f"margin:0 0 6px;color:{_C_MUTED}"
             )
             blocks.append(
                 f'<li style="{item_style}">'
@@ -2129,40 +2389,52 @@ def markdown_to_email_html(markdown):
 
 
 def build_email_html(subject, body):
+    """
+    Executive briefing email shell. The masthead presents the briefing as a
+    confidential daily intelligence note; the body hosts the metrics strip
+    and section cards rendered by render_digest_markdown().
+    """
     content = markdown_to_email_html(body)
     escaped_subject = html.escape(subject)
-    generated_at = html.escape(datetime.now().strftime("%B %d, %Y"))
+    now = datetime.now()
+    today_long = html.escape(now.strftime("%A, %B %d, %Y"))
+    iso_date = html.escape(now.strftime("%Y-%m-%d"))
     return f"""<!doctype html>
 <html>
-  <body style="margin:0;padding:0;background:#f1f5f9;font-family:Arial,Helvetica,sans-serif;color:#243041">
-    <div style="display:none;max-height:0;overflow:hidden;color:#edf2f7;opacity:0">
-      {escaped_subject}
-    </div>
-    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;background:#f1f5f9">
+  <body style="margin:0;padding:0;background:#eef1f4;font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;color:{_C_TEXT}">
+    <div style="display:none;max-height:0;overflow:hidden;color:#eef1f4;opacity:0">{escaped_subject}</div>
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;background:#eef1f4">
       <tr>
-        <td align="center" style="padding:28px 14px">
-          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;max-width:860px;background:#ffffff;border:1px solid #d8e2ec;border-radius:8px;overflow:hidden;box-shadow:0 16px 44px rgba(15,23,42,0.08)">
+        <td align="center" style="padding:32px 14px">
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;max-width:780px;background:#ffffff;border:1px solid #d8dde4">
+            <tr><td style="height:3px;background:{_C_INK};font-size:0;line-height:0">&nbsp;</td></tr>
             <tr>
-              <td style="padding:28px 32px;background:#102033;color:#ffffff;border-bottom:4px solid #38bdf8">
+              <td style="padding:28px 36px 24px;background:{_C_INK};color:#e5e9f0">
                 <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse">
                   <tr>
                     <td style="vertical-align:top">
-                      <div style="font-size:12px;letter-spacing:0.08em;text-transform:uppercase;color:#93c5fd;font-weight:800">OpenFang News</div>
-                      <h1 style="margin:8px 0 0;font-size:28px;line-height:1.22;font-weight:800;color:#ffffff;letter-spacing:0">{escaped_subject}</h1>
+                      <div style="font-size:10px;letter-spacing:0.20em;text-transform:uppercase;color:#94a3b8;font-weight:700">Confidential &middot; Internal Briefing</div>
+                      <h1 style="margin:12px 0 6px;font-size:24px;line-height:1.25;font-weight:800;color:#ffffff;letter-spacing:-0.01em">Cybersecurity Intelligence Briefing</h1>
+                      <div style="font-size:13px;color:#94a3b8;line-height:1.5">{today_long}</div>
                     </td>
                     <td align="right" style="vertical-align:top;white-space:nowrap">
-                      <span style="display:inline-block;padding:8px 11px;border:1px solid rgba(255,255,255,0.26);border-radius:8px;color:#dbeafe;font-size:12px;font-weight:700">{generated_at}</span>
+                      <div style="font-size:9px;letter-spacing:0.18em;text-transform:uppercase;color:#94a3b8;font-weight:700">Issue</div>
+                      <div style="font-size:13px;font-weight:700;color:#e5e9f0;margin-top:6px;font-family:'SF Mono',Menlo,Consolas,monospace;letter-spacing:0.04em">{iso_date}</div>
                     </td>
                   </tr>
                 </table>
-                <p style="margin:16px 0 0;color:#d7e5f5;font-size:14px;line-height:1.6">
-                  Top company security stories from today and yesterday, plus targeted vendor intelligence from your app inventory.
-                </p>
               </td>
             </tr>
             <tr>
-              <td style="padding:32px;background:#fbfdff">
+              <td style="padding:30px 36px 12px;background:#ffffff">
                 {content}
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:20px 36px 26px;background:{_C_PANEL};border-top:1px solid {_C_RULE};color:{_C_MUTED};font-size:11px;line-height:1.6">
+                <div style="text-transform:uppercase;letter-spacing:0.16em;font-weight:700;color:{_C_INK};margin-bottom:6px;font-size:10px">OpenFang Threat Intelligence</div>
+                <div>Prepared for senior leadership &middot; Distribution: internal use only.</div>
+                <div style="margin-top:4px">Sources cited inline. Advisory data reflects vendor publications as of {iso_date}.</div>
               </td>
             </tr>
           </table>
