@@ -73,7 +73,7 @@ MAILERSEND_TO = os.getenv("MAILERSEND_TO", SMTP_TO)
 MAILERSEND_USER_AGENT = os.getenv("MAILERSEND_USER_AGENT", "openfang-news/1.0")
 
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "nemotron3:33b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:26b")
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "")
 _ollama_timeout_raw = os.getenv("OLLAMA_CHAT_TIMEOUT_SECONDS", "none")
 OLLAMA_CHAT_TIMEOUT_SECONDS = (
@@ -395,11 +395,26 @@ def _parse_json_response(raw: str, label: str) -> dict:
 # ---------------------------------------------------------------------------
 
 _GENERAL_SYSTEM_PROMPT = (
-    "You are a cybersecurity analyst producing structured JSON. "
-    "Analyse the supplied article snippet and return ONLY a single valid JSON object "
-    "matching the schema exactly. Do not add prose, markdown fences, or extra keys. "
-    "Use 'Not stated' for any field the article does not provide. "
-    "If the article has no security relevance set skipped=true and skip_reason to a short reason."
+    "You are a cybersecurity analyst producing structured JSON for a daily defender briefing.\n"
+    "Rules — follow ALL of them:\n"
+    "1. Return ONLY a single valid JSON object matching the schema. No prose, no markdown fences, no extra keys.\n"
+    "2. Use 'Not stated' for any field the article snippet does NOT explicitly contain. "
+    "Do NOT infer or invent CVE IDs, CVSS scores, version numbers, fixed versions, or vendor names — "
+    "if it is not in the snippet, the value is 'Not stated'.\n"
+    "3. 'organization' is the primary affected vendor/company (e.g. 'Microsoft', 'Cisco', 'Fortinet', 'Apple'). "
+    "Use the most specific name available. Use 'Multiple vendors' only if the article truly covers many at once.\n"
+    "4. 'severity' is the article's overall threat level — Critical / High / Medium / Low / Info. "
+    "Base it on the highest-severity CVE described or the article's described impact. Never leave blank.\n"
+    "5. 'why_it_matters' is exactly 1-2 short sentences focused on defender impact (who is at risk, what an attacker could do). "
+    "No filler, no marketing language, no restating the title.\n"
+    "6. 'patch_priority' is one of: Immediate, High, Moderate, Low, Not applicable. "
+    "Use Immediate for actively exploited or Critical CVEs, High for Critical/High without active exploitation, "
+    "Moderate for Medium severity, Low for informational items.\n"
+    "7. 'defender_action' is one concrete imperative sentence telling defenders what to do today "
+    "(e.g. 'Patch Exchange Server to KB5012345 and audit recent OWA auth logs.'). No vague verbs like 'review' or 'monitor' alone.\n"
+    "8. Skip the article (skipped=true, short skip_reason) ONLY if it is marketing, opinion, an event recap, "
+    "or contains no actionable security finding. Otherwise always produce a full analysis.\n"
+    "9. Be deterministic: given the same input the same JSON must come out."
 )
 
 
@@ -422,7 +437,7 @@ def analyse_general_article(rank: int, result: dict) -> GeneralItem:
     snippet = "\n".join([
         f"Title: {pinned_title}",
         f"URL: {pinned_url}",
-        f"Snippet: {result.get('content', '')[:1200]}",
+        f"Snippet: {result.get('content', '')[:2000]}",
     ])
 
     raw = ollama_chat([
@@ -480,11 +495,29 @@ def analyse_general_article(rank: int, result: dict) -> GeneralItem:
     return item
 
 
+_SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
+_EXPLOIT_ORDER = {
+    "EXPLOITED IN WILD": 0,
+    "POC AVAILABLE": 1,
+    "NO KNOWN EXPLOIT": 2,
+    "NOT STATED": 3,
+}
+
+
+def _general_sort_key(item: GeneralItem) -> tuple[int, int]:
+    severity = (item.severity or "").strip().upper()
+    exploit_statuses = [c.exploitation_status.strip().upper() for c in item.cves if c.exploitation_status]
+    exploit_rank = min((_EXPLOIT_ORDER.get(s, 4) for s in exploit_statuses), default=4)
+    return (_SEVERITY_ORDER.get(severity, 5), exploit_rank)
+
+
 def analyse_general_articles(results: list[dict]) -> list[GeneralItem]:
     """
     Analyse each general-security article individually.
     Articles are processed sequentially; skipped items are filtered out unless
     every item was skipped (in which case we keep them all so the digest is not empty).
+    Final list is sorted by severity (Critical first) and exploitation status, then
+    rank is reassigned 1..N so the digest is consistent across runs.
     """
     items: list[GeneralItem] = []
     for index, result in enumerate(results, start=1):
@@ -492,13 +525,19 @@ def analyse_general_articles(results: list[dict]) -> list[GeneralItem]:
         items.append(item)
 
     active = [i for i in items if not i.skipped]
+    final = active if active else items
+
+    final.sort(key=_general_sort_key)
+    for new_rank, item in enumerate(final, start=1):
+        item.rank = new_rank
+
     LOGGER.info(
         "analyse_general_batch_complete total=%s active=%s skipped=%s",
         len(items),
         len(active),
         len(items) - len(active),
     )
-    return active if active else items
+    return final
 
 
 # ---------------------------------------------------------------------------
@@ -506,13 +545,22 @@ def analyse_general_articles(results: list[dict]) -> list[GeneralItem]:
 # ---------------------------------------------------------------------------
 
 _VENDOR_SYSTEM_PROMPT = (
-    "You are a cybersecurity analyst producing structured JSON. "
-    "You will receive a list of article snippets all related to one vendor. "
-    "Analyse them collectively and return ONLY a single valid JSON object "
-    "matching the schema exactly. Do not add prose, markdown fences, or extra keys. "
-    "Use 'Not stated' for any field the articles do not provide. "
-    "If none of the articles contain a real security finding for this vendor, "
-    "set skipped=true and skip_reason to a short reason."
+    "You are a cybersecurity analyst producing structured JSON for a daily vendor watch briefing.\n"
+    "You receive numbered article snippets ([1], [2], ...) all related to one vendor. "
+    "Analyse them collectively and return ONE JSON object describing concrete security findings for that vendor.\n"
+    "Rules — follow ALL of them:\n"
+    "1. Return ONLY a single valid JSON object matching the schema. No prose, no markdown fences, no extra keys.\n"
+    "2. Each entry in 'findings' MUST describe a specific vulnerability, advisory, breach, or active threat affecting this vendor's products. "
+    "Do NOT create findings for: marketing pages, partner announcements, conference talks, generic 'X is secure' articles, "
+    "or articles where this vendor is only mentioned in passing.\n"
+    "3. Use 'Not stated' for any field the articles do NOT explicitly contain. "
+    "Do NOT invent CVE IDs, CVSS scores, version numbers, or patch identifiers — if an article does not state it, the field is 'Not stated'.\n"
+    "4. 'summary' is 2-3 sentences describing this vendor's current security posture from the articles: "
+    "what is wrong, what is being patched, what defenders should pay attention to.\n"
+    "5. 'source_url' on each finding MUST be one of the article URLs supplied in the input — copy it verbatim from the [N] block that best supports the finding.\n"
+    "6. 'defender_action' on each finding is one concrete imperative sentence for defenders. No vague advice.\n"
+    "7. If NO article describes a real, actionable security finding for this vendor, set skipped=true and skip_reason='No actionable findings'.\n"
+    "8. Be deterministic: given the same input the same JSON must come out."
 )
 
 
@@ -537,7 +585,7 @@ def analyse_vendor_articles(vendor_name: str, results: list[dict]) -> VendorItem
         snippets.append(
             f"[{idx}] Title: {r.get('title', '')}\n"
             f"    URL: {r.get('url', '')}\n"
-            f"    Snippet: {r.get('content', '')[:800]}"
+            f"    Snippet: {r.get('content', '')[:1400]}"
         )
 
     raw = ollama_chat([
@@ -711,49 +759,90 @@ def _severity_badge(severity: str) -> str:
 
 
 def render_general_items_markdown(items: list[GeneralItem]) -> str:
-    """Render a numbered markdown list for the general security section."""
+    """
+    Render each general security item as a self-contained markdown card.
+
+    Why `### #N` headings instead of `N.` markdown list items:
+    each item has multi-line continuation content (severity, why_it_matters,
+    CVEs, action, source link). The continuation lines do not match the `<ol>`
+    list-item pattern, so the markdown→HTML converter closes the list after
+    the first line and opens a fresh `<ol>` for the next item — which
+    auto-numbers from 1 every time. Using a heading puts the rank in the
+    heading text, sidestepping `<ol>` auto-numbering entirely.
+    """
     if not items:
         return "_No general security stories were found today._\n"
 
-    lines: list[str] = []
+    blocks: list[str] = []
     for item in items:
-        lines.append(f"{item.rank}. **{item.organization}** – {item.title}")
-        lines.append(f"   {_severity_badge(item.severity)} | Patch priority: {item.patch_priority}")
-        lines.append(f"   {item.why_it_matters}")
+        title_text = item.title or item.raw_title or "Untitled"
+        org = item.organization if item.organization and item.organization != "Not stated" else ""
+        if org:
+            heading = f"### #{item.rank} · {org} — {title_text}"
+        else:
+            heading = f"### #{item.rank} · {title_text}"
+
+        lines: list[str] = [heading, ""]
+
+        meta_parts: list[str] = []
+        if item.severity and item.severity != "Not stated":
+            meta_parts.append(_severity_badge(item.severity))
+        if item.patch_priority and item.patch_priority != "Not stated":
+            meta_parts.append(f"Patch priority: **{item.patch_priority}**")
+        if meta_parts:
+            lines.append(" · ".join(meta_parts))
+            lines.append("")
+
+        if item.why_it_matters:
+            lines.append(item.why_it_matters)
+            lines.append("")
 
         if item.cves:
             if len(item.cves) == 1:
                 cve = item.cves[0]
-                lines.append(
-                    f"   CVE: `{cve.cve_id}` | CVSS: {cve.cvss_score} | "
-                    f"Class: {cve.vuln_class} | Vector: {cve.attack_vector} | "
-                    f"Exploitation: {cve.exploitation_status} | "
-                    f"Fixed in: {cve.fixed_version}"
-                )
+                cve_parts: list[str] = []
+                if cve.affected_product and cve.affected_product != "Not stated":
+                    cve_parts.append(f"Product: **{cve.affected_product}**")
+                if cve.cve_id and cve.cve_id != "Not stated":
+                    cve_parts.append(f"CVE: `{cve.cve_id}`")
+                if cve.cvss_score and cve.cvss_score != "Not stated":
+                    cve_parts.append(f"CVSS: {cve.cvss_score}")
+                if cve.vuln_class and cve.vuln_class != "Not stated":
+                    cve_parts.append(f"Class: {cve.vuln_class}")
+                if cve.exploitation_status and cve.exploitation_status != "Not stated":
+                    cve_parts.append(f"Exploitation: {cve.exploitation_status}")
+                if cve.fixed_version and cve.fixed_version != "Not stated":
+                    cve_parts.append(f"Fixed in: `{cve.fixed_version}`")
+                if cve_parts:
+                    lines.append(" | ".join(cve_parts))
+                    lines.append("")
             else:
-                lines.append("")
                 lines.append(
-                    "   | Product | CVE ID | CVSS | Severity | Class | "
-                    "Exploitation | Fixed In |"
+                    "| Product | CVE ID | CVSS | Severity | Class | Exploitation | Fixed In |"
                 )
                 lines.append(
-                    "   |---------|--------|------|----------|-------|"
-                    "--------------|---------|"
+                    "|---|---|---|---|---|---|---|"
                 )
                 for cve in item.cves:
                     lines.append(
-                        f"   | {cve.affected_product} | `{cve.cve_id}` | "
+                        f"| {cve.affected_product} | `{cve.cve_id}` | "
                         f"{cve.cvss_score} | {cve.severity} | {cve.vuln_class} | "
-                        f"{cve.exploitation_status} | {cve.fixed_version} |"
+                        f"{cve.exploitation_status} | `{cve.fixed_version}` |"
                     )
+                lines.append("")
 
         if item.defender_action:
-            lines.append(f"   🛡️ **Action:** {item.defender_action}")
+            lines.append(f"🛡️ **Action:** {item.defender_action}")
+            lines.append("")
 
-        lines.append(f"   🔗 [{item.title}]({item.source_url})")
-        lines.append("")
+        if item.source_url:
+            link_label = item.raw_title or item.title or "Read the article"
+            lines.append(f"🔗 [{link_label}]({item.source_url})")
+            lines.append("")
 
-    return "\n".join(lines)
+        blocks.append("\n".join(lines))
+
+    return "\n".join(blocks)
 
 
 def render_vendor_items_markdown(items: list[VendorItem]) -> str:
@@ -917,25 +1006,35 @@ def render_executive_snapshot(
     """
     Ask the LLM to write the 3-5 bullet executive snapshot from the
     already-structured objects (much cheaper than re-analysing everything).
+    Input is pre-sorted by severity so the model receives a stable ordering.
     """
+    # general_items already arrives sorted by severity from analyse_general_articles.
+    # We pass a compact, deduplicated payload so the model focuses on the highest-impact entries.
+    top_general = general_items[: min(8, GENERAL_SECURITY_MAX_ITEMS)]
     summary_data = {
         "general": [
             {
-                "title": i.title,
+                "rank": i.rank,
                 "organization": i.organization,
+                "title": i.title,
                 "severity": i.severity,
+                "patch_priority": i.patch_priority,
+                "exploited": any(
+                    "EXPLOITED" in (c.exploitation_status or "").upper() for c in i.cves
+                ),
+                "cve_ids": [c.cve_id for c in i.cves if c.cve_id and c.cve_id != "Not stated"][:3],
                 "why_it_matters": i.why_it_matters,
-                "cve_count": len(i.cves),
             }
-            for i in general_items[:GENERAL_SECURITY_MAX_ITEMS]
+            for i in top_general
         ],
         "vendors": [
             {
                 "vendor": v.vendor_name,
-                "summary": v.summary,
                 "finding_count": len(v.findings),
+                "summary": v.summary,
             }
             for v in vendor_items
+            if v.findings or v.summary
         ],
     }
 
@@ -943,14 +1042,22 @@ def render_executive_snapshot(
         {
             "role": "system",
             "content": (
-                "You are a cybersecurity analyst. Write exactly 3-5 concise bullet points "
-                "summarising the most important takeaways from the structured digest data below. "
-                "Return only the bullet points, each starting with '- '. No headers, no preamble."
+                "You are a cybersecurity analyst writing the executive bullet summary at the top of a daily defender briefing.\n"
+                "Rules:\n"
+                "1. Output exactly 3 to 5 bullet points, each on its own line starting with '- '.\n"
+                "2. Order bullets by priority: actively exploited Critical first, then other Critical, then High. "
+                "Do not include Medium / Low / Info unless there is nothing more severe.\n"
+                "3. Each bullet is ONE sentence covering: who is affected, what the issue is, and what defenders should do today. "
+                "Use the vendor/organization name from the data.\n"
+                "4. Cite a CVE ID in backticks when one is available (e.g. `CVE-2026-1234`).\n"
+                "5. Do NOT invent CVEs, vendors, or facts that are not in the structured data.\n"
+                "6. No headers, no preamble, no closing remarks, no markdown other than '- ' bullets and backticks.\n"
+                "7. Be deterministic — given the same data the same bullets must come out."
             ),
         },
         {
             "role": "user",
-            "content": f"Digest summary data:\n{json.dumps(summary_data, indent=2)}",
+            "content": f"Digest summary data (already sorted by severity):\n{json.dumps(summary_data, indent=2)}",
         },
     ])
     return raw.strip()
@@ -1767,7 +1874,7 @@ def fallback_digest(ollama_error):
 # Email rendering
 # ---------------------------------------------------------------------------
 
-def render_inline_markdown(text):
+def render_inline_markdown(text, *, style_severity_badges=True):
     escaped = html.escape(text)
 
     def replace_link(match):
@@ -1791,6 +1898,8 @@ def render_inline_markdown(text):
     escaped = re.sub(r"__([^_]+)__", r"<strong>\1</strong>", escaped)
     escaped = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<em>\1</em>", escaped)
     escaped = re.sub(r"(?<!_)_([^_\n]+)_(?!_)", r"<em>\1</em>", escaped)
+    if not style_severity_badges:
+        return escaped
     return render_severity_badges(escaped)
 
 
@@ -1944,7 +2053,9 @@ def markdown_to_email_html(markdown):
             close_paragraph()
             close_lists()
             level = len(heading.group(1))
-            heading_text = render_inline_markdown(heading.group(2).strip())
+            heading_text = render_inline_markdown(
+                heading.group(2).strip(), style_severity_badges=False
+            )
             if level == 1:
                 blocks.append(
                     '<h1 style="margin:0 0 18px;font-size:24px;line-height:1.25;'
