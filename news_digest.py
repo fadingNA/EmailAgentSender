@@ -1764,7 +1764,7 @@ def fallback_digest(ollama_error):
 
 
 # ---------------------------------------------------------------------------
-# Email rendering (unchanged)
+# Email rendering
 # ---------------------------------------------------------------------------
 
 def render_inline_markdown(text):
@@ -1777,7 +1777,7 @@ def render_inline_markdown(text):
             return match.group(0)
         return (
             f'<a href="{html.escape(url, quote=True)}" '
-            'style="color:#155eef;text-decoration:none;font-weight:700">'
+            'style="color:#2563eb;text-decoration:none;font-weight:700">'
             f"{label}</a>"
         )
 
@@ -1791,7 +1791,37 @@ def render_inline_markdown(text):
     escaped = re.sub(r"__([^_]+)__", r"<strong>\1</strong>", escaped)
     escaped = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<em>\1</em>", escaped)
     escaped = re.sub(r"(?<!_)_([^_\n]+)_(?!_)", r"<em>\1</em>", escaped)
-    return escaped
+    return render_severity_badges(escaped)
+
+
+def render_severity_badges(markup):
+    """Style severity words in visible text without touching HTML tags."""
+    severity_styles = {
+        "Critical": ("#fee2e2", "#991b1b", "#fecaca"),
+        "High": ("#ffedd5", "#9a3412", "#fed7aa"),
+        "Medium": ("#fef9c3", "#854d0e", "#fde68a"),
+        "Low": ("#dcfce7", "#166534", "#bbf7d0"),
+        "Info": ("#dbeafe", "#1e40af", "#bfdbfe"),
+    }
+
+    def replace_text_segment(segment):
+        for label, (background, color, border) in severity_styles.items():
+            segment = re.sub(
+                rf"(?<!\w){label}(?!\w)",
+                (
+                    f'<span style="display:inline-block;padding:3px 8px;border-radius:999px;'
+                    f'background:{background};color:{color};border:1px solid {border};'
+                    f'font-size:12px;line-height:1.2;font-weight:800">{label}</span>'
+                ),
+                segment,
+            )
+        return segment
+
+    parts = re.split(r"(<[^>]+>)", markup)
+    return "".join(
+        part if part.startswith("<") and part.endswith(">") else replace_text_segment(part)
+        for part in parts
+    )
 
 
 def markdown_to_email_html(markdown):
@@ -1818,27 +1848,30 @@ def markdown_to_email_html(markdown):
 
     def render_table(headers, rows):
         header_html = "".join(
-            '<th style="padding:11px 12px;background:#e8f0f8;color:#0f172a;'
-            'font-size:13px;line-height:1.35;text-align:left;border:1px solid #cbd5e1;'
-            'font-weight:800">'
+            '<th style="padding:12px 14px;background:#eef4ff;color:#0f172a;'
+            'font-size:12px;line-height:1.35;text-align:left;border-bottom:1px solid #d7e3f5;'
+            'font-weight:800;text-transform:uppercase">'
             f"{render_inline_markdown(header)}</th>"
             for header in headers
         )
         row_html = []
-        for row in rows:
+        for row_index, row in enumerate(rows):
             padded_row = row[: len(headers)] + [""] * max(0, len(headers) - len(row))
+            row_background = "#ffffff" if row_index % 2 == 0 else "#f8fbff"
             cells = "".join(
-                '<td style="padding:10px 12px;color:#334155;font-size:14px;'
-                'line-height:1.45;border:1px solid #dbe5ef;vertical-align:top">'
+                f'<td style="padding:12px 14px;color:#334155;font-size:14px;'
+                f'line-height:1.5;border-bottom:1px solid #e6edf7;vertical-align:top;'
+                f'background:{row_background}">'
                 f"{render_inline_markdown(cell)}</td>"
                 for cell in padded_row
             )
             row_html.append(f"<tr>{cells}</tr>")
         return (
-            '<table style="width:100%;margin:0 0 18px;border-collapse:collapse;'
-            'background:#ffffff;border:1px solid #cbd5e1">'
+            '<div style="margin:0 0 22px;overflow-x:auto;border:1px solid #d7e3f5;'
+            'border-radius:8px;background:#ffffff">'
+            '<table style="width:100%;border-collapse:collapse;background:#ffffff">'
             f"<thead><tr>{header_html}</tr></thead>"
-            f"<tbody>{''.join(row_html)}</tbody></table>"
+            f"<tbody>{''.join(row_html)}</tbody></table></div>"
         )
 
     def close_paragraph():
@@ -1846,7 +1879,7 @@ def markdown_to_email_html(markdown):
             return
         text = " ".join(line.strip() for line in paragraph_lines)
         blocks.append(
-            '<p style="margin:0 0 16px;line-height:1.62;color:#334155;font-size:15px">'
+            '<p style="margin:0 0 18px;line-height:1.68;color:#334155;font-size:15px">'
             f"{render_inline_markdown(text)}</p>"
         )
         paragraph_lines.clear()
@@ -1914,22 +1947,23 @@ def markdown_to_email_html(markdown):
             heading_text = render_inline_markdown(heading.group(2).strip())
             if level == 1:
                 blocks.append(
-                    '<h1 style="margin:0 0 18px;font-size:25px;line-height:1.22;'
-                    'font-weight:800;color:#0f172a">'
+                    '<h1 style="margin:0 0 18px;font-size:24px;line-height:1.25;'
+                    'font-weight:800;color:#0f172a;letter-spacing:0">'
                     f"{heading_text}</h1>"
                 )
             elif level == 2:
                 blocks.append(
-                    '<div style="margin:26px 0 14px;padding:13px 16px;'
-                    "background:#f7fafc;border:1px solid #dbe5ef;border-left:4px solid #155eef;"
+                    '<div style="margin:30px 0 16px;padding:14px 16px;'
+                    "background:#f8fafc;border:1px solid #dbe5ef;border-left:4px solid #2563eb;"
                     'border-radius:8px">'
                     '<h2 style="margin:0;font-size:18px;line-height:1.3;font-weight:800;color:#0f172a">'
                     f"{heading_text}</h2></div>"
                 )
             else:
                 blocks.append(
-                    '<h3 style="margin:20px 0 10px;font-size:16px;line-height:1.3;'
-                    'font-weight:800;color:#1e293b">'
+                    '<h3 style="margin:22px 0 10px;font-size:16px;line-height:1.35;'
+                    'font-weight:800;color:#1e293b;border-bottom:1px solid #e2e8f0;'
+                    'padding-bottom:7px">'
                     f"{heading_text}</h3>"
                 )
             index += 1
@@ -1947,15 +1981,16 @@ def markdown_to_email_html(markdown):
                 if len(list_stack) > depth:
                     blocks.append(f"</{list_stack.pop()}>")
                 list_style = (
-                    "margin:0 0 18px;padding:0;line-height:1.55;color:#334155;list-style-position:inside"
+                    "margin:0 0 22px;padding:0 0 0 22px;line-height:1.58;color:#334155"
                     if depth == 0
-                    else "margin:8px 0 14px 18px;padding:0;line-height:1.55;color:#334155"
+                    else "margin:8px 0 14px 20px;padding:0;line-height:1.55;color:#334155"
                 )
                 blocks.append(f'<{tag} style="{list_style}">')
                 list_stack.append(tag)
             item_style = (
-                "margin:0 0 10px;padding:12px 14px;background:#ffffff;"
-                "border:1px solid #e2e8f0;border-radius:8px;color:#334155"
+                "margin:0 0 12px;padding:14px 16px;background:#ffffff;"
+                "border:1px solid #e2e8f0;border-left:4px solid #38bdf8;"
+                "border-radius:8px;color:#334155"
                 if depth == 0
                 else "margin:0 0 8px;color:#334155"
             )
@@ -1988,34 +2023,34 @@ def build_email_html(subject, body):
     generated_at = html.escape(datetime.now().strftime("%B %d, %Y"))
     return f"""<!doctype html>
 <html>
-  <body style="margin:0;padding:0;background:#edf2f7;font-family:Arial,Helvetica,sans-serif;color:#243041">
+  <body style="margin:0;padding:0;background:#f1f5f9;font-family:Arial,Helvetica,sans-serif;color:#243041">
     <div style="display:none;max-height:0;overflow:hidden;color:#edf2f7;opacity:0">
       {escaped_subject}
     </div>
-    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;background:#edf2f7">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;background:#f1f5f9">
       <tr>
-        <td align="center" style="padding:30px 14px">
-          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;max-width:820px;background:#ffffff;border:1px solid #d8e2ec;border-radius:8px;overflow:hidden;box-shadow:0 14px 38px rgba(15,23,42,0.08)">
+        <td align="center" style="padding:28px 14px">
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;max-width:860px;background:#ffffff;border:1px solid #d8e2ec;border-radius:8px;overflow:hidden;box-shadow:0 16px 44px rgba(15,23,42,0.08)">
             <tr>
-              <td style="padding:26px 30px;background:#111827;color:#ffffff;border-bottom:4px solid #2dd4bf">
+              <td style="padding:28px 32px;background:#102033;color:#ffffff;border-bottom:4px solid #38bdf8">
                 <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse">
                   <tr>
                     <td style="vertical-align:top">
-                      <div style="font-size:12px;letter-spacing:0.08em;text-transform:uppercase;color:#8bd3ff;font-weight:800">Cybersecurity News</div>
-                      <h1 style="margin:8px 0 0;font-size:26px;line-height:1.22;font-weight:800;color:#ffffff">{escaped_subject}</h1>
+                      <div style="font-size:12px;letter-spacing:0.08em;text-transform:uppercase;color:#93c5fd;font-weight:800">OpenFang News</div>
+                      <h1 style="margin:8px 0 0;font-size:28px;line-height:1.22;font-weight:800;color:#ffffff;letter-spacing:0">{escaped_subject}</h1>
                     </td>
                     <td align="right" style="vertical-align:top;white-space:nowrap">
-                      <span style="display:inline-block;padding:7px 10px;border:1px solid rgba(255,255,255,0.24);border-radius:8px;color:#dbeafe;font-size:12px;font-weight:700">{generated_at}</span>
+                      <span style="display:inline-block;padding:8px 11px;border:1px solid rgba(255,255,255,0.26);border-radius:8px;color:#dbeafe;font-size:12px;font-weight:700">{generated_at}</span>
                     </td>
                   </tr>
                 </table>
-                <p style="margin:14px 0 0;color:#cbd5e1;font-size:14px;line-height:1.55">
+                <p style="margin:16px 0 0;color:#d7e5f5;font-size:14px;line-height:1.6">
                   Top company security stories from today and yesterday, plus targeted vendor intelligence from your app inventory.
                 </p>
               </td>
             </tr>
             <tr>
-              <td style="padding:30px;background:#fbfdff">
+              <td style="padding:32px;background:#fbfdff">
                 {content}
               </td>
             </tr>
